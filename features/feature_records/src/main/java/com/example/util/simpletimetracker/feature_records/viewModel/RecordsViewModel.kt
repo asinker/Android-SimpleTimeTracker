@@ -6,10 +6,12 @@ import androidx.lifecycle.viewModelScope
 import com.example.util.simpletimetracker.core.base.BaseViewModel
 import com.example.util.simpletimetracker.core.base.SingleLiveEvent
 import com.example.util.simpletimetracker.core.extension.set
+import com.example.util.simpletimetracker.core.extension.shiftTimeStamp
 import com.example.util.simpletimetracker.core.extension.toParams
 import com.example.util.simpletimetracker.core.interactor.GetChangeRecordNavigationParamsInteractor
 import com.example.util.simpletimetracker.core.interactor.SharingInteractor
 import com.example.util.simpletimetracker.core.mapper.RangeViewDataMapper
+import com.example.util.simpletimetracker.core.mapper.TimeMapper
 import com.example.util.simpletimetracker.core.model.NavigationTab
 import com.example.util.simpletimetracker.domain.darkMode.interactor.ThemeChangedInteractor
 import com.example.util.simpletimetracker.domain.extension.orZero
@@ -38,10 +40,12 @@ import com.example.util.simpletimetracker.navigation.params.screen.ChangeRunning
 import com.example.util.simpletimetracker.navigation.params.screen.ChangeRunningRecordParams
 import com.example.util.simpletimetracker.navigation.params.screen.RecordQuickActionsParams
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 @HiltViewModel
@@ -59,6 +63,7 @@ class RecordsViewModel @Inject constructor(
     private val getChangeRecordNavigationParamsInteractor: GetChangeRecordNavigationParamsInteractor,
     private val recordsContainerMultiselectInteractor: RecordsContainerMultiselectInteractor,
     private val themeChangedInteractor: ThemeChangedInteractor,
+    private val timeMapper: TimeMapper,
 ) : BaseViewModel() {
 
     var extra: RecordsExtra? = null
@@ -255,6 +260,40 @@ class RecordsViewModel @Inject constructor(
             ChartFilterType.ACTIVITY -> prefsInteractor.setFilteredTypesOnList(dataIds)
             ChartFilterType.CATEGORY -> prefsInteractor.setFilteredCategoriesOnList(dataIds)
             ChartFilterType.RECORD_TAG -> prefsInteractor.setFilteredTagsOnList(dataIds)
+        }
+    }
+
+    /**
+     * Called when the user dragged out a new record on the calendar view.
+     * Timestamps are absolute and already resolved to the dragged day.
+     */
+    fun onCalendarDragCreate(
+        startTime: Long,
+        endTime: Long,
+    ) {
+        viewModelScope.launch {
+            // Preferences read and date math stay off the main thread, only the
+            // navigation itself has to run on it.
+            val daysFromToday = withContext(Dispatchers.Default) {
+                val startOfDayShift = prefsInteractor.getStartOfDayShift()
+                timeMapper.toTimestampShift(
+                    toTime = startTime.shiftTimeStamp(startOfDayShift),
+                    range = RangeLength.Day,
+                    firstDayOfWeek = prefsInteractor.getFirstDayOfWeek(),
+                ).toInt()
+            }
+
+            throttle {
+                router.navigate(
+                    ChangeRecordFromMainParams(
+                        ChangeRecordParams.NewWithTime(
+                            timeStarted = startTime,
+                            timeEnded = endTime,
+                            daysFromToday = daysFromToday,
+                        ),
+                    ),
+                )
+            }.invoke()
         }
     }
 

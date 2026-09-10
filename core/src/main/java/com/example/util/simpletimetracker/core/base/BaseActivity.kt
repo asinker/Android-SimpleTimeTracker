@@ -29,8 +29,24 @@ abstract class BaseActivity<T : ViewBinding> : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         allowDiskRead { super.onCreate(savedInstanceState) }
         contextProvider.attach(this)
-        themeManager.setTheme(this)
-        _binding = inflater(layoutInflater)
+        // enableEdgeToEdge() calls Window.getDecorView(), which creates the DecorView
+        // and initializes AccessibilityManager. That is a binder call executed inside
+        // system_server, and on some OEM roms (OnePlus/Oppo OplusHansManager) it reads
+        // /proc, which StrictMode attributes back to this process as a DiskReadViolation.
+        // The decor view cannot be created later, so the read is allowed here, same as
+        // for super.onCreate() above.
+        allowDiskRead { themeManager.setTheme(this) }
+        // OnePlus/Oppo read a config file from disk in the static initializer of the
+        // first OverScroller, which is reached here while TabLayout inflates a
+        // HorizontalScrollView. Layout inflation has to run on the main thread and
+        // that rom behaviour cannot be avoided, so only this call is allowed to
+        // read from disk.
+        val oldPolicy = android.os.StrictMode.allowThreadDiskReads()
+        try {
+            _binding = inflater(layoutInflater)
+        } finally {
+            android.os.StrictMode.setThreadPolicy(oldPolicy)
+        }
         setContentView(binding.root)
         binding.root.applyStatusBarInsets()
         initUi()

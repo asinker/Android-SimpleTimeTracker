@@ -86,6 +86,11 @@ class RecordsFragment :
     override fun initUx() {
         binding.viewRecordsCalendar.root.setClickListener(viewModel::onCalendarClick)
         binding.viewRecordsCalendar.root.setLongClickListener(viewModel::onCalendarLongClick)
+        // Long press on an empty calendar area and drag out a new record.
+        // The view resolves the dragged column to an absolute timestamp, the
+        // view model opens the add record screen with those times prefilled.
+        binding.viewRecordsCalendar.root.onNewRecordSelectedListener =
+            viewModel::onCalendarDragCreate
     }
 
     override fun initViewModel() {

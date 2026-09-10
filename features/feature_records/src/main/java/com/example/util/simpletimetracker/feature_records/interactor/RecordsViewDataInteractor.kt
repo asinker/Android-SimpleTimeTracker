@@ -210,6 +210,7 @@ class RecordsViewDataInteractor @Inject constructor(
                     legend = legend,
                     highlighted = column.isToday,
                     data = points,
+                    rangeStart = column.rangeStart,
                 )
             }
             .let { list ->

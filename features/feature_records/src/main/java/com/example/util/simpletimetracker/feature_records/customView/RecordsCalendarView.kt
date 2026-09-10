@@ -16,6 +16,7 @@ import android.text.TextUtils
 import android.util.AttributeSet
 import android.util.TypedValue
 import android.view.ContextThemeWrapper
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -126,6 +127,35 @@ class RecordsCalendarView @JvmOverloads constructor(
     private var clickListener: (ViewHolderType) -> Unit = {}
     private var longClickListener: (ViewHolderType) -> Unit = {}
 
+    // Called when the user long pressed an empty calendar area and dragged out
+    // a new time range. Both values are absolute timestamps, already resolved
+    // to the day the drag happened on (including the calendar column, when
+    // several days are shown at once).
+    var onNewRecordSelectedListener: ((startTime: Long, endTime: Long) -> Unit)? = null
+
+    // Drag on an empty area to create a new record.
+    private var dragState: DragState = DragState.IDLE
+    // Millis elapsed since the start of the day (0..dayInMillis), the same
+    // units RecordsCalendarViewData.Point.start / Point.end use.
+    private var dragStartTime: Long = 0L
+    private var dragEndTime: Long = 0L
+    // Time of the long press, kept fixed while the other end follows the finger.
+    private var dragAnchorTime: Long = 0L
+    private var dragColumnIndex: Int = 0
+    // Last snapped grid step, used to fire a haptic tick only on step changes.
+    private var dragLastSnapTime: Long = 0L
+    private val dragPreviewPaint: Paint = Paint()
+    private val dragPreviewStrokePaint: Paint = Paint()
+    private val dragPreviewTextPaint: Paint = Paint()
+    private val dragPreviewStrokeWidth: Float = 2.dpToPx().toFloat()
+    private val dragPreviewTextPadding: Float = 4.dpToPx().toFloat()
+    private var dragPreviewLabel: String = ""
+    // Read once during construction, so the drag gesture itself never has to
+    // touch Context / Resources while the finger is moving.
+    private val amPmTemplate: String = context.getString(R.string.separator_template)
+    private val minuteInMillis: Long = TimeUnit.MINUTES.toMillis(1)
+    private val minDragDurationInMillis: Long = TimeUnit.MINUTES.toMillis(15)
+
     private val nameTextView: AppCompatTextView by lazy {
         getTextView(
             textColor = nameTextColor,
@@ -169,7 +199,7 @@ class RecordsCalendarView @JvmOverloads constructor(
     private val singleTapDetector = SingleTapDetector(
         context = context,
         onSingleTap = ::onEventClick,
-        onLongPress = ::onEventLongClick,
+        onLongPress = ::onEventLongPress,
     )
     private val scaleDetector = ScaleDetector(
         context = context,
@@ -188,6 +218,13 @@ class RecordsCalendarView @JvmOverloads constructor(
         initArgs(context, attrs, defStyleAttr)
         initPaint()
         initEditMode()
+    }
+
+    override fun onDetachedFromWindow() {
+        // Never leave a half finished drag behind: it would keep the parent
+        // from receiving touches and hold on to stale state.
+        cancelDragCreate()
+        super.onDetachedFromWindow()
     }
 
     override fun onSaveInstanceState(): Parcelable {
@@ -233,14 +270,39 @@ class RecordsCalendarView @JvmOverloads constructor(
                 index = index,
             )
         }
+        // Draw the draft being created on top of the existing blocks.
+        if (dragState == DragState.DRAGGING_NEW) {
+            drawNewRecordPreview(canvas)
+        }
     }
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
         var handled = false
 
-        when (event.action) {
+        when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> handled = true
+
+            MotionEvent.ACTION_MOVE -> {
+                if (dragState == DragState.DRAGGING_NEW) {
+                    onDragCreateMove(event)
+                    handled = true
+                }
+            }
+
+            MotionEvent.ACTION_UP -> {
+                if (dragState == DragState.DRAGGING_NEW) {
+                    onDragCreateFinish()
+                    handled = true
+                }
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                if (dragState == DragState.DRAGGING_NEW) {
+                    cancelDragCreate()
+                    handled = true
+                }
+            }
         }
 
         return handled or
@@ -256,6 +318,8 @@ class RecordsCalendarView @JvmOverloads constructor(
     fun setLongClickListener(listener: (ViewHolderType) -> Unit) {
         this.longClickListener = listener
     }
+
+    fun isCreatingNewRecord(): Boolean = dragState == DragState.DRAGGING_NEW
 
     fun setData(viewData: RecordsCalendarViewData) {
         currentTime = viewData.currentTime
@@ -273,6 +337,7 @@ class RecordsCalendarView @JvmOverloads constructor(
         lastScaleFactor = 1f
         panFactor = 0f
         lastPanFactor = 0f
+        resetDragState()
         invalidate()
     }
 
@@ -365,6 +430,26 @@ class RecordsCalendarView @JvmOverloads constructor(
             isAntiAlias = true
             color = currentTimeLegendColor
             strokeWidth = currentTimeLegendWidth
+        }
+        dragPreviewPaint.apply {
+            isAntiAlias = true
+            style = Paint.Style.FILL
+            color = currentTimeLegendColor
+            alpha = DRAG_PREVIEW_ALPHA
+        }
+        dragPreviewStrokePaint.apply {
+            isAntiAlias = true
+            style = Paint.Style.STROKE
+            color = currentTimeLegendColor
+            strokeWidth = dragPreviewStrokeWidth
+        }
+        dragPreviewTextPaint.apply {
+            isAntiAlias = true
+            style = Paint.Style.FILL
+            textAlign = Paint.Align.CENTER
+            color = nameTextColor
+            textSize = nameTextSize
+            typeface = Typeface.DEFAULT_BOLD
         }
     }
 
@@ -841,6 +926,7 @@ class RecordsCalendarView @JvmOverloads constructor(
                         legend = "Sun",
                         highlighted = false,
                         data = it,
+                        rangeStart = 0L,
                     )
                     RecordsCalendarViewData(
                         currentTime = 18 * hourInMillis,
@@ -885,6 +971,7 @@ class RecordsCalendarView @JvmOverloads constructor(
             legend = data.legend,
             highlighted = data.highlighted,
             data = res,
+            rangeStart = data.rangeStart,
         )
     }
 
@@ -936,6 +1023,8 @@ class RecordsCalendarView @JvmOverloads constructor(
     }
 
     private fun onEventScaleStart() {
+        // A second finger aborts an in progress drag creation.
+        cancelDragCreate()
         isScaling = true
         if (isSwiping) lastPanFactor = panFactor
     }
@@ -959,6 +1048,7 @@ class RecordsCalendarView @JvmOverloads constructor(
     }
 
     private fun onEventSwipeStart() {
+        if (dragState != DragState.IDLE) return
         isSwiping = true
         shouldRebaseSwipeAfterScaleStop = false
         swipeStartOffset = 0f
@@ -971,6 +1061,8 @@ class RecordsCalendarView @JvmOverloads constructor(
         direction: SwipeDetector.Direction,
         event: MotionEvent,
     ) {
+        // Vertical dragging is repurposed for creating a new record.
+        if (dragState != DragState.IDLE) return
         if (direction.isHorizontal() || isScaling) return
         // Keep swipe baseline in sync with active pinch to avoid handoff jumps.
         if (shouldRebaseSwipeAfterScaleStop) {
@@ -986,6 +1078,7 @@ class RecordsCalendarView @JvmOverloads constructor(
     }
 
     private fun onEventSwipeStop() {
+        if (dragState != DragState.IDLE) return
         isSwiping = false
         shouldRebaseSwipeAfterScaleStop = false
         if (isScaling) return
@@ -996,6 +1089,281 @@ class RecordsCalendarView @JvmOverloads constructor(
     private fun coercePan() {
         val maxPanAvailable = chartHeight * scaleFactor - chartHeight
         panFactor = panFactor.coerceIn(-maxPanAvailable, 0f)
+    }
+
+    /**
+     * Long press dispatcher. A press on an existing block keeps the old
+     * quick actions behaviour, a press on an empty area starts drafting a
+     * brand new record.
+     */
+    private fun onEventLongPress(event: MotionEvent) {
+        if (dragState != DragState.IDLE) return
+
+        val existingPoint = findDataPoint(x = event.x, y = event.y)
+        if (existingPoint != null) {
+            onEventLongClick(event)
+        } else {
+            onDragCreateStart(event)
+        }
+    }
+
+    private fun onDragCreateStart(event: MotionEvent) {
+        if (data.isEmpty() || chartHeight <= 0f) return
+
+        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        // Keep ViewPager2 and parent scroll containers from stealing the gesture.
+        parent?.requestDisallowInterceptTouchEvent(true)
+
+        dragColumnIndex = xToColumnIndex(event.x)
+        // Anchor is snapped, so the draft always sits on the grid.
+        dragAnchorTime = snapToStep(yToTime(event.y))
+        dragStartTime = dragAnchorTime
+        dragEndTime = dragAnchorTime
+        dragLastSnapTime = dragAnchorTime
+        dragState = DragState.DRAGGING_NEW
+        updateDragPreviewLabel()
+        invalidate()
+    }
+
+    private fun onDragCreateMove(event: MotionEvent) {
+        val current = snapToStep(yToTime(event.y))
+        // Mechanical tick, but only when the snapped quarter hour step changes.
+        if (current != dragLastSnapTime) {
+            dragLastSnapTime = current
+            performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+        }
+        dragStartTime = if (current < dragAnchorTime) current else dragAnchorTime
+        dragEndTime = if (current > dragAnchorTime) current else dragAnchorTime
+        updateDragPreviewLabel()
+        invalidate()
+    }
+
+    private fun onDragCreateFinish() {
+        // Re-align to the grid, then enforce the minimum duration.
+        var start = snapToStep(dragStartTime)
+        var end = snapToStep(dragEndTime)
+        if (end - start < minDragDurationInMillis) {
+            end = (start + minDragDurationInMillis).coerceAtMost(dayInMillis)
+            start = (end - minDragDurationInMillis).coerceAtLeast(0L)
+        }
+
+        // Restore absolute time of the day the drag happened on, then clamp it
+        // to that whole day so nothing outside the day can ever be reported.
+        val columnIndex = dragColumnIndex.coerceIn(0, dataSize - 1)
+        val dayRangeStart = data.getOrNull(columnIndex)?.rangeStart ?: 0L
+        val dayRangeEnd = dayRangeStart + dayInMillis
+        val absoluteStart = (dayRangeStart + start).coerceIn(dayRangeStart, dayRangeEnd)
+        val absoluteEnd = (dayRangeStart + end).coerceIn(dayRangeStart, dayRangeEnd)
+
+        resetDragState()
+        invalidate()
+
+        // Never report an empty or inverted range.
+        if (absoluteEnd <= absoluteStart) return
+
+        onNewRecordSelectedListener?.invoke(absoluteStart, absoluteEnd)
+    }
+
+    private fun cancelDragCreate() {
+        if (dragState == DragState.IDLE) return
+        resetDragState()
+        invalidate()
+    }
+
+    private fun resetDragState() {
+        if (dragState == DragState.DRAGGING_NEW) {
+            parent?.requestDisallowInterceptTouchEvent(false)
+        }
+        dragState = DragState.IDLE
+        dragAnchorTime = 0L
+        dragStartTime = 0L
+        dragEndTime = 0L
+        dragLastSnapTime = 0L
+        dragPreviewLabel = ""
+    }
+
+    /**
+     * Millis since the start of the day (0..dayInMillis) to Y in pixels.
+     * Exact inverse of [yToTime], mirroring the formula [drawData] uses:
+     *
+     *   boxBottom = chartTopBound + (chartHeight - boxShift) * scaleFactor + panFactor
+     *   boxShift  = chartHeight * time / dayInMillis
+     */
+    private fun timeToY(time: Long): Float {
+        if (chartHeight <= 0f) return chartTopBound + panFactor
+
+        val fraction = (time.toFloat() / dayInMillis).coerceIn(0f, 1f)
+        val offset = if (reverseOrder) chartHeight * fraction else chartHeight * (1f - fraction)
+        return chartTopBound + panFactor + offset * scaleFactor
+    }
+
+    /**
+     * Y in pixels to millis since the start of the day (0..dayInMillis).
+     *
+     * Touch coordinates are view local, so padding and the view own scroll
+     * offset are removed first to land in the same space [Canvas] draws in.
+     * This view has no padding, and panning is applied through [panFactor]
+     * rather than scrolling, so both terms are 0 by default.
+     */
+    private fun yToTime(y: Float): Long {
+        if (chartHeight <= 0f) return 0L
+
+        // Clamp to the currently visible chart, so dragging past the screen
+        // edge can never produce a timestamp outside this day.
+        val visibleTop = chartTopBound + panFactor
+        val visibleBottom = visibleTop + chartHeight * scaleFactor
+        val chartY = (y - paddingTop + scrollY).coerceIn(visibleTop, visibleBottom)
+
+        val offset = (chartY - chartTopBound - panFactor) / scaleFactor
+        val fraction = if (reverseOrder) offset / chartHeight else (chartHeight - offset) / chartHeight
+        return (fraction * dayInMillis).toLong().coerceIn(0L, dayInMillis)
+    }
+
+    /**
+     * Snaps to the clock grid drawn by the side legend. The legend lines are
+     * offset by [startOfDayShift], so the shift is added before rounding and
+     * removed afterwards, keeping snapping aligned with what the user sees.
+     */
+    private fun snapToStep(
+        timeMillis: Long,
+        stepMinutes: Int = DEFAULT_SNAP_STEP_MINUTES,
+    ): Long {
+        val step = TimeUnit.MINUTES.toMillis(stepMinutes.toLong())
+        if (step <= 0L) return timeMillis.coerceIn(0L, dayInMillis)
+
+        val shifted = timeMillis + startOfDayShift
+        val remainder = shifted % step
+        val rounded = if (remainder * 2 >= step) shifted - remainder + step else shifted - remainder
+        return (rounded - startOfDayShift).coerceIn(0L, dayInMillis)
+    }
+
+    private fun xToColumnIndex(x: Float): Int {
+        if (columnWidth <= 0f) return 0
+        return ((x - chartLeftBound) / columnWidth)
+            .toInt()
+            .coerceIn(0, dataSize - 1)
+    }
+
+    /**
+     * Draws the ghost block for the record being dragged out: translucent
+     * themed rounded rect, its stroke outline and a live start - end label.
+     */
+    private fun drawNewRecordPreview(canvas: Canvas) {
+        if (chartHeight <= 0f) return
+
+        val index = dragColumnIndex.coerceIn(0, dataSize - 1)
+        val boxLeft = chartLeftBound + columnWidth * index + paddingBetweenDays / 2
+        val boxRight = chartLeftBound + columnWidth * (index + 1) - paddingBetweenDays / 2
+        if (boxRight - boxLeft <= 0f) return
+
+        val startY = timeToY(dragStartTime)
+        val endY = timeToY(dragEndTime)
+        // Safe for both drag directions and for reverseOrder.
+        val boxTop = minOf(startY, endY)
+        var boxBottom = maxOf(startY, endY)
+
+        // Right after the long press start is equal to end, keep a 15 minute hint visible.
+        val minHeight = chartHeight * scaleFactor * minDragDurationInMillis / dayInMillis
+        if (boxBottom - boxTop < minHeight) boxBottom = boxTop + minHeight
+
+        recordBounds.set(boxLeft, boxTop, boxRight, boxBottom)
+        // Translucent background.
+        canvas.drawRoundRect(
+            recordBounds,
+            recordCornerRadius,
+            recordCornerRadius,
+            dragPreviewPaint,
+        )
+        // Outline.
+        canvas.drawRoundRect(
+            recordBounds,
+            recordCornerRadius,
+            recordCornerRadius,
+            dragPreviewStrokePaint,
+        )
+
+        drawNewRecordPreviewLabel(
+            canvas = canvas,
+            boxLeft = boxLeft,
+            boxRight = boxRight,
+            boxTop = boxTop,
+        )
+    }
+
+    private fun drawNewRecordPreviewLabel(
+        canvas: Canvas,
+        boxLeft: Float,
+        boxRight: Float,
+        boxTop: Float,
+    ) {
+        if (dragPreviewLabel.isEmpty()) return
+
+        dragPreviewTextPaint.getTextBounds(
+            dragPreviewLabel,
+            0,
+            dragPreviewLabel.length,
+            textBounds,
+        )
+        val textWidth = dragPreviewTextPaint.measureText(dragPreviewLabel)
+        val textHeight = textBounds.height().toFloat()
+        val halfWidth = textWidth / 2
+
+        val centerX = (boxLeft + boxRight) / 2
+        val minCenterX = chartLeftBound + halfWidth
+        val maxCenterX = chartRightBound - halfWidth
+        val textCenterX = if (minCenterX <= maxCenterX) {
+            centerX.coerceIn(minCenterX, maxCenterX)
+        } else {
+            centerX
+        }
+
+        // Prefer drawing above the block, otherwise pin it to the block top edge.
+        val aboveBaseline = boxTop - dragPreviewTextPadding
+        val baseline = if (aboveBaseline - textHeight >= chartTopBound) {
+            aboveBaseline
+        } else {
+            boxTop + dragPreviewTextPadding + textHeight
+        }
+
+        canvas.drawText(dragPreviewLabel, textCenterX, baseline, dragPreviewTextPaint)
+    }
+
+    private fun updateDragPreviewLabel() {
+        dragPreviewLabel = formatDragTimeText(dragStartTime) +
+            DRAG_PREVIEW_TIME_SEPARATOR +
+            formatDragTimeText(dragEndTime)
+    }
+
+    /**
+     * [dayOffset] uses the same units as RecordsCalendarViewData.Point.start,
+     * which is [startOfDayShift] behind the wall clock, so the shift is added
+     * back before formatting. Honors the military time setting.
+     *
+     * Runs on every ACTION_MOVE, so it only touches in memory fields and never
+     * performs a Context / Resources lookup.
+     */
+    private fun formatDragTimeText(dayOffset: Long): String {
+        val clockMillis = (dayOffset + startOfDayShift).mod(dayInMillis)
+        val totalMinutes = (clockMillis / minuteInMillis).toInt()
+        val hour = totalMinutes / MINUTES_IN_HOUR
+        val minute = totalMinutes % MINUTES_IN_HOUR
+        val minuteText = minute.toString().padStart(2, '0')
+
+        return if (isMilitary) {
+            hour.toString().padStart(2, '0') + ":" + minuteText
+        } else {
+            val isAfterMidday = hour >= 12
+            val hour12 = when {
+                hour == 0 -> 12
+                hour > 12 -> hour - 12
+                else -> hour
+            }
+            String.format(
+                amPmTemplate,
+                hour12.toString().padStart(2, '0') + ":" + minuteText,
+                if (isAfterMidday) PM_SUFFIX else AM_SUFFIX,
+            )
+        }
     }
 
     private fun findDataPoint(
@@ -1086,6 +1454,7 @@ class RecordsCalendarView @JvmOverloads constructor(
         val legend: String,
         val highlighted: Boolean,
         val data: List<Data>,
+        val rangeStart: Long,
     )
 
     private inner class Data(
@@ -1114,7 +1483,18 @@ class RecordsCalendarView @JvmOverloads constructor(
         val panFactor: Float,
     )
 
+    enum class DragState {
+        IDLE,
+        DRAGGING_NEW,
+    }
+
     companion object {
         private const val CLICK_ANIMATION_DURATION_MS: Long = 250L
+        private const val DEFAULT_SNAP_STEP_MINUTES: Int = 15
+        private const val DRAG_PREVIEW_ALPHA: Int = 90
+        private const val DRAG_PREVIEW_TIME_SEPARATOR: String = " - "
+        private const val MINUTES_IN_HOUR: Int = 60
+        private const val AM_SUFFIX: String = "am"
+        private const val PM_SUFFIX: String = "pm"
     }
 }

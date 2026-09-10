@@ -249,6 +249,10 @@ class ChangeRecordViewModel @Inject constructor(
                 recordState.newTimeEnded = getInitialTimeEnded(daysFromToday)
                 recordState.newTimeStarted = getInitialTimeStarted(recordState.newTimeEnded, daysFromToday)
             }
+            is ChangeRecordParams.NewWithTime -> {
+                recordState.newTimeStarted = extra.timeStarted
+                recordState.newTimeEnded = extra.timeEnded
+            }
         }
         recordState.originalRecordId = recordId.orZero()
         editorDelegate.afterInitializePreviewViewData()

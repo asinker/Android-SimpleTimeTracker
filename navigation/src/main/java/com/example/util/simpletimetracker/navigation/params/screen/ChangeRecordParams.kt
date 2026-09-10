@@ -30,6 +30,15 @@ sealed class ChangeRecordParams : Parcelable {
         override val daysFromToday: Int,
     ) : ChangeRecordParams()
 
+    // Creates a new record with an explicitly provided time range.
+    // Used by the calendar drag-to-create gesture.
+    @Parcelize
+    data class NewWithTime(
+        val timeStarted: Long,
+        val timeEnded: Long,
+        override val daysFromToday: Int,
+    ) : ChangeRecordParams()
+
     @Parcelize
     data class Preview(
         val name: String,

@@ -18,6 +18,10 @@ data class RecordsCalendarViewData(
         val legend: String,
         val highlighted: Boolean,
         val data: List<Point>,
+        // Absolute timestamp of the start of the day this column represents.
+        // Point.start / Point.end are offsets from it, so the absolute time
+        // can be restored as rangeStart + Point.start / Point.end.
+        val rangeStart: Long,
     )
 
     data class Point(
