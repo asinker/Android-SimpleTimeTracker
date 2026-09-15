@@ -2,12 +2,8 @@ name: Publish signed release
 
 on:
   push:
-    branches:
-      - dev
     tags:
       - 'v*'
-    paths:
-      - '.github/workflows/github_release.yml'
   workflow_dispatch:
     inputs:
       tag:
@@ -136,7 +132,8 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --title "Simple Time Tracker 1.59.1 Calendar Drag" \
               --notes-file dist/RELEASE_NOTES.md \
-              --prerelease
+              --prerelease=false \
+              --latest
             gh release upload "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" --clobber \
               "dist/$APK_NAME" "dist/$APK_NAME.sha256"
@@ -145,6 +142,6 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --title "Simple Time Tracker 1.59.1 Calendar Drag" \
               --notes-file dist/RELEASE_NOTES.md \
-              --prerelease \
+              --latest \
               "dist/$APK_NAME" "dist/$APK_NAME.sha256"
           fi
