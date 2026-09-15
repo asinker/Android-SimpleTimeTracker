@@ -46,6 +46,45 @@ class RecordsCalendarDragMathTest {
     }
 
     @Test
+    fun `record boundary snapping uses nearest end inside threshold`() {
+        val result = RecordsCalendarDragMath.snapToRecordEnd(
+            timeMillis = 10 * hour,
+            recordEnds = listOf(8 * hour, 10 * hour + 7 * minute, 12 * hour),
+            thresholdMillis = 15 * minute,
+            minimumValue = 0L,
+            maximumValue = 23 * hour,
+        )
+
+        assertEquals(10 * hour + 7 * minute, result)
+    }
+
+    @Test
+    fun `record boundary snapping preserves free placement outside threshold`() {
+        val result = RecordsCalendarDragMath.snapToRecordEnd(
+            timeMillis = 10 * hour,
+            recordEnds = listOf(8 * hour, 10 * hour + 16 * minute),
+            thresholdMillis = 15 * minute,
+            minimumValue = 0L,
+            maximumValue = 23 * hour,
+        )
+
+        assertEquals(10 * hour, result)
+    }
+
+    @Test
+    fun `record boundary snapping ignores ends that cannot fit the range`() {
+        val result = RecordsCalendarDragMath.snapToRecordEnd(
+            timeMillis = 22 * hour,
+            recordEnds = listOf(22 * hour + 5 * minute),
+            thresholdMillis = 15 * minute,
+            minimumValue = 0L,
+            maximumValue = 22 * hour,
+        )
+
+        assertEquals(22 * hour, result)
+    }
+
+    @Test
     fun `column mapping supports multiple days and clamps outside chart`() {
         assertEquals(0, RecordsCalendarDragMath.columnIndex(-20f, 10f, 100f, 3))
         assertEquals(0, RecordsCalendarDragMath.columnIndex(50f, 10f, 100f, 3))

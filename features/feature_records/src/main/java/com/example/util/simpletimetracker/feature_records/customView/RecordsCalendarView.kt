@@ -136,10 +136,9 @@ class RecordsCalendarView @JvmOverloads constructor(
     // several days are shown at once).
     var onNewRecordSelectedListener: ((startTime: Long, endTime: Long) -> Unit)? = null
 
-    // Called when the user confirmed a new range for an existing record in the
-    // calendar edit mode, by tapping its block. Both values are absolute
-    // timestamps of the day the record is shown on. Editing itself never
-    // reports anything: the drag only previews, the tap is what commits.
+    // Called when the user confirms a new range for an existing record by
+    // tapping anywhere after previewing the adjustment. Both values are
+    // absolute timestamps of the day the record is shown on.
     var onRecordTimeAdjustedListener: ((recordId: Long, startTime: Long, endTime: Long) -> Unit)? = null
 
     // Drag on an empty area to create a new record.
@@ -214,6 +213,8 @@ class RecordsCalendarView @JvmOverloads constructor(
     private val amPmTemplate: String = context.getString(R.string.separator_template)
     private val minuteInMillis: Long = TimeUnit.MINUTES.toMillis(1)
     private val minDragDurationInMillis: Long = TimeUnit.MINUTES.toMillis(15)
+    private val adjacentRecordSnapThresholdInMillis: Long =
+        TimeUnit.MINUTES.toMillis(ADJACENT_RECORD_SNAP_THRESHOLD_MINUTES)
 
     // True while the user is inside edit mode, with or without a finger down.
     private val isEditing: Boolean
@@ -225,10 +226,12 @@ class RecordsCalendarView @JvmOverloads constructor(
     // True when the previewed range differs from the last confirmed one, which
     // is what the translucent "not saved yet" look is based on.
     private val hasPendingEdit: Boolean
-        get() = editRecordId != null &&
-            (dragStartTime != editSavedStart ||
+        get() {
+            val isRangeChanged = dragStartTime != editSavedStart ||
                 dragEndTime != editSavedEnd ||
-                dragColumnIndex != editSavedColumnIndex)
+                dragColumnIndex != editSavedColumnIndex
+            return editRecordId != null && isRangeChanged
+        }
 
     private val nameTextView: AppCompatTextView by lazy {
         getTextView(
@@ -457,7 +460,7 @@ class RecordsCalendarView @JvmOverloads constructor(
     /**
      * Enters edit mode for the given record: the block gets a highlighted
      * outline and a handle on both ends, which can be dragged to change the
-     * time range. Nothing is saved until the user taps the block.
+     * time range. Nothing is saved until the user taps anywhere to finish.
      *
      * Returns false when the record cannot be edited right here, which is the
      * case when it is not visible on the currently shown days or when the day
@@ -489,8 +492,8 @@ class RecordsCalendarView @JvmOverloads constructor(
     }
 
     /**
-     * Leaves edit mode. Unsaved changes are dropped, which is what tapping
-     * outside of the edited block does as well.
+     * Leaves edit mode and drops unsaved changes. This remains an explicit
+     * programmatic cancellation path; normal taps commit before leaving.
      */
     fun exitEditMode() {
         if (!isEditing) return
@@ -1512,7 +1515,7 @@ class RecordsCalendarView @JvmOverloads constructor(
     /**
      * ACTION_DOWN dispatcher. In edit mode it decides which part of the
      * highlighted block was grabbed: the handle on one end, the block itself,
-     * or nothing, which leaves edit mode and drops unsaved changes.
+     * or nothing, which commits the preview and leaves edit mode.
      */
     private fun onTouchDown(event: MotionEvent) {
         suppressTapForGesture = false
@@ -1547,11 +1550,10 @@ class RecordsCalendarView @JvmOverloads constructor(
         }
 
         if (grabbed == null) {
-            // Touched outside of the edited block: that is "cancel", so the
-            // unsaved range is dropped and the gesture is consumed, keeping it
-            // from opening whatever record happens to be under the finger.
+            // A tap anywhere confirms the current preview. Consume this
+            // gesture so the same tap cannot open another record underneath.
             suppressTapForGesture = true
-            exitEditMode()
+            commitEdit()
             return
         }
 
@@ -1616,7 +1618,7 @@ class RecordsCalendarView @JvmOverloads constructor(
 
     /**
      * Drag on the handles or on the block itself. Everything is a preview: the
-     * range is only reported to the listener when the user taps the block.
+     * range is only reported to the listener when the user taps to finish.
      */
     private fun onEditDragMove(event: MotionEvent) {
         dragPointerX = event.x
@@ -1630,10 +1632,9 @@ class RecordsCalendarView @JvmOverloads constructor(
         pointerY: Float,
         trackTouchSlop: Boolean,
     ) {
-        if (trackTouchSlop && !isEditDragMoved &&
-            (abs(pointerX - editGrabX) > editDragTouchSlop ||
-                abs(pointerY - editGrabY) > editDragTouchSlop)
-        ) {
+        val movedPastTouchSlop = abs(pointerX - editGrabX) > editDragTouchSlop ||
+            abs(pointerY - editGrabY) > editDragTouchSlop
+        if (trackTouchSlop && !isEditDragMoved && movedPastTouchSlop) {
             isEditDragMoved = true
         }
         val current = snapToStep(yToTime(pointerY))
@@ -1646,8 +1647,12 @@ class RecordsCalendarView @JvmOverloads constructor(
         when (dragState) {
             DragState.EDIT_DRAGGING_START -> {
                 // The end stays where it was, the start follows the finger.
-                dragStartTime = current.coerceIn(
+                val candidate = current.coerceIn(
                     minimumValue = 0L,
+                    maximumValue = editGrabEnd - minDragDurationInMillis,
+                )
+                dragStartTime = snapStartToPreviousRecordEnd(
+                    candidate = candidate,
                     maximumValue = editGrabEnd - minDragDurationInMillis,
                 )
             }
@@ -1672,8 +1677,12 @@ class RecordsCalendarView @JvmOverloads constructor(
                     anchor = dragAnchorTime,
                     current = current,
                 ).let {
-                    dragStartTime = it.start
-                    dragEndTime = it.end
+                    val duration = it.end - it.start
+                    dragStartTime = snapStartToPreviousRecordEnd(
+                        candidate = it.start,
+                        maximumValue = dayInMillis - duration,
+                    )
+                    dragEndTime = dragStartTime + duration
                 }
             }
             else -> {}
@@ -1685,7 +1694,7 @@ class RecordsCalendarView @JvmOverloads constructor(
     /**
      * A move started by long press is saved as soon as the finger is released,
      * matching calendar drag-and-drop behaviour. Existing handle editing keeps
-     * its preview-and-tap-to-confirm flow.
+     * its preview-and-tap-anywhere-to-confirm flow.
      */
     private fun onEditDragFinish() {
         if (editDragStartedByLongPress) {
@@ -1699,8 +1708,8 @@ class RecordsCalendarView @JvmOverloads constructor(
             return
         }
 
-        val isBlockTapped = dragState == DragState.EDIT_DRAGGING_MOVE && !isEditDragMoved
-        if (isBlockTapped) {
+        // A tap on the body or either handle confirms the pending preview.
+        if (!isEditDragMoved) {
             commitEdit()
             return
         }
@@ -1749,9 +1758,14 @@ class RecordsCalendarView @JvmOverloads constructor(
     private fun snapEditRange() {
         when (dragState) {
             DragState.EDIT_DRAGGING_START -> {
-                dragStartTime = snapToStep(dragStartTime).coerceIn(
+                val maximumValue = dragEndTime - minDragDurationInMillis
+                val candidate = snapToStep(dragStartTime).coerceIn(
                     minimumValue = 0L,
-                    maximumValue = dragEndTime - minDragDurationInMillis,
+                    maximumValue = maximumValue,
+                )
+                dragStartTime = snapStartToPreviousRecordEnd(
+                    candidate = candidate,
+                    maximumValue = maximumValue,
                 )
             }
             DragState.EDIT_DRAGGING_END -> {
@@ -1762,7 +1776,12 @@ class RecordsCalendarView @JvmOverloads constructor(
             }
             DragState.EDIT_DRAGGING_MOVE -> {
                 val duration = dragEndTime - dragStartTime
-                dragStartTime = snapToStep(dragStartTime).coerceIn(0L, dayInMillis - duration)
+                val maximumValue = dayInMillis - duration
+                val candidate = snapToStep(dragStartTime).coerceIn(0L, maximumValue)
+                dragStartTime = snapStartToPreviousRecordEnd(
+                    candidate = candidate,
+                    maximumValue = maximumValue,
+                )
                 dragEndTime = dragStartTime + duration
             }
             else -> {}
@@ -1770,8 +1789,8 @@ class RecordsCalendarView @JvmOverloads constructor(
     }
 
     /**
-     * The tap that saves: the previewed range, if it changed anything, is
-     * reported to the listener and edit mode ends.
+     * A finishing tap anywhere saves the previewed range, if it changed, and
+     * ends edit mode.
      */
     private fun commitEdit() {
         val recordId = editRecordId
@@ -1852,6 +1871,34 @@ class RecordsCalendarView @JvmOverloads constructor(
             timeMillis = timeMillis,
             startOfDayShift = startOfDayShift,
             stepMinutes = stepMinutes,
+        )
+    }
+
+    /**
+     * Snaps the edited block's logical start to a nearby end boundary in the
+     * target day. The edited record itself is excluded from the candidates.
+     */
+    private fun snapStartToPreviousRecordEnd(
+        candidate: Long,
+        maximumValue: Long,
+    ): Long {
+        val recordId = editRecordId
+        val recordEnds = data.getOrNull(dragColumnIndex)
+            ?.data
+            .orEmpty()
+            .asSequence()
+            .filterNot {
+                (it.point.data.value as? RecordViewData.Tracked)?.id == recordId
+            }
+            .map { it.point.end }
+            .asIterable()
+
+        return RecordsCalendarDragMath.snapToRecordEnd(
+            timeMillis = candidate,
+            recordEnds = recordEnds,
+            thresholdMillis = adjacentRecordSnapThresholdInMillis,
+            minimumValue = 0L,
+            maximumValue = maximumValue,
         )
     }
 
@@ -2231,6 +2278,7 @@ class RecordsCalendarView @JvmOverloads constructor(
     companion object {
         private const val CLICK_ANIMATION_DURATION_MS: Long = 250L
         private const val DEFAULT_SNAP_STEP_MINUTES: Int = 15
+        private const val ADJACENT_RECORD_SNAP_THRESHOLD_MINUTES: Long = 15L
         private const val DRAG_PREVIEW_ALPHA: Int = 90
         private const val EDIT_SELECTION_HALO_ALPHA: Int = 110
         private const val EDIT_SELECTION_SCALE: Float = 1.025f

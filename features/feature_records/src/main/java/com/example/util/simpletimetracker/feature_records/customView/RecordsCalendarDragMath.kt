@@ -3,6 +3,7 @@ package com.example.util.simpletimetracker.feature_records.customView
 import java.util.Calendar
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 /** Pure calculations used by calendar dragging and covered by JVM tests. */
 internal object RecordsCalendarDragMath {
@@ -53,6 +54,32 @@ internal object RecordsCalendarDragMath {
         val remainder = shifted.mod(step)
         val rounded = if (remainder * 2 >= step) shifted - remainder + step else shifted - remainder
         return (rounded - startOfDayShift).coerceIn(0L, dayInMillis)
+    }
+
+    /**
+     * Magnetically snaps a boundary to the closest record end while it is
+     * within [thresholdMillis]. Targets outside the allowed range are ignored.
+     */
+    fun snapToRecordEnd(
+        timeMillis: Long,
+        recordEnds: Iterable<Long>,
+        thresholdMillis: Long,
+        minimumValue: Long,
+        maximumValue: Long,
+    ): Long {
+        val safeMinimum = minimumValue.coerceAtMost(maximumValue)
+        val safeMaximum = maximumValue.coerceAtLeast(minimumValue)
+        val time = timeMillis.coerceIn(safeMinimum, safeMaximum)
+        if (thresholdMillis < 0L) return time
+
+        return recordEnds
+            .asSequence()
+            .filter { it in safeMinimum..safeMaximum }
+            .map { target -> target to abs(target - time) }
+            .filter { (_, distance) -> distance <= thresholdMillis }
+            .minWithOrNull(compareBy<Pair<Long, Long>> { it.second }.thenBy { it.first })
+            ?.first
+            ?: time
     }
 
     fun columnIndex(

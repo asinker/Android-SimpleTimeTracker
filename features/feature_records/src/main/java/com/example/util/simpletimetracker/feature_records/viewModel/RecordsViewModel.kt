@@ -320,7 +320,7 @@ class RecordsViewModel @Inject constructor(
     }
 
     /**
-     * Called when the user confirmed a new range by tapping the block in the
+     * Called when the user confirmed a new range by tapping anywhere in the
      * calendar edit mode. The record is updated right away, without any extra
      * screen, and the calendar is refreshed with the new range.
      */

@@ -95,8 +95,8 @@ class RecordsFragment :
         // view model opens the add record screen with those times prefilled.
         binding.viewRecordsCalendar.root.onNewRecordSelectedListener =
             viewModel::onCalendarDragCreate
-        // Tapping the block in the calendar edit mode confirms the previewed
-        // range, which is then saved right away.
+        // Tapping anywhere in calendar edit mode confirms the previewed range,
+        // which is then saved right away.
         binding.viewRecordsCalendar.root.onRecordTimeAdjustedListener =
             viewModel::onRecordTimeAdjusted
     }
