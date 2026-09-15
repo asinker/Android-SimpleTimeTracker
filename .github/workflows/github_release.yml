@@ -1,4 +1,4 @@
-name: Publish unsigned release
+name: Publish signed release
 
 on:
   push:
@@ -17,6 +17,9 @@ on:
 
 permissions:
   contents: write
+
+env:
+  APK_NAME: SimpleTimeTracker-1.59.1-calendar-release.apk
 
 jobs:
   release:
@@ -58,22 +61,42 @@ jobs:
       - name: Run calendar drag tests
         run: ./gradlew :feature_records:testDebugUnitTest --stacktrace
 
-      - name: Build unsigned Base Release
+      - name: Build Base Release
         run: ./gradlew :app:assembleBaseRelease --stacktrace
+
+      - name: Sign and verify APK
+        shell: bash
+        env:
+          SIGNING_KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$SIGNING_KEY_B64"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+          mkdir -p dist
+          printf '%s' "$SIGNING_KEY_B64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+          BUILD_TOOLS_DIR="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --out "dist/$APK_NAME" \
+            app/build/outputs/apk/base/release/app-base-release-unsigned.apk
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "dist/$APK_NAME"
 
       - name: Prepare release files
         shell: bash
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
-          mkdir -p dist
-          cp app/build/outputs/apk/base/release/app-base-release-unsigned.apk \
-            dist/SimpleTimeTracker-1.59.1-calendar-release-unsigned.apk
           cd dist
-          sha256sum SimpleTimeTracker-1.59.1-calendar-release-unsigned.apk \
-            > SimpleTimeTracker-1.59.1-calendar-release-unsigned.apk.sha256
+          sha256sum "$APK_NAME" > "$APK_NAME.sha256"
           cat > RELEASE_NOTES.md <<EOF
-          ## Unofficial unsigned build / 非官方未签名版本
+          ## Unofficial signed build / 非官方独立签名版本
 
           This is an independently maintained, unofficial modification of
           [Razeeman/Android-SimpleTimeTracker](https://github.com/Razeeman/Android-SimpleTimeTracker).
@@ -81,10 +104,13 @@ jobs:
 
           本版本增加了日历时间块长按拖动、跨日期移动、边缘自动滚动、选中反馈和调整后撤销等功能。
 
-          **The attached APK is unsigned and cannot be installed directly on Android.**
-          It is provided for source-to-binary verification, archival, or signing with your own key.
+          **The attached APK is signed with this fork's independent release key and can be installed directly.**
+          Its signature is not the upstream author's signature, so it cannot update an upstream installation in place.
 
-          **附件 APK 未签名，不能直接在 Android 手机上安装。** 它仅用于存档、验证，或由下载者使用自己的密钥签名。
+          **附件 APK 使用本分支自己的发布证书签名，可以直接安装。** 它不能覆盖原作者签名的正式版；如有冲突，请先备份数据再卸载原版。
+
+          Signing certificate SHA-256 / 签名证书指纹：
+          7338BF172B19103F901E712ACE9C3A4CC0FD243AC45DC75F3A8BD96D9DE02709
 
           Complete corresponding source is available from this release tag:
           https://github.com/${GITHUB_REPOSITORY}/tree/${RELEASE_TAG}
@@ -99,10 +125,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
-          gh release create "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Simple Time Tracker 1.59.1 Calendar Drag (unsigned)" \
-            --notes-file dist/RELEASE_NOTES.md \
-            --prerelease \
-            dist/SimpleTimeTracker-1.59.1-calendar-release-unsigned.apk \
-            dist/SimpleTimeTracker-1.59.1-calendar-release-unsigned.apk.sha256
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete-asset "$RELEASE_TAG" \
+              SimpleTimeTracker-1.59.1-calendar-release-unsigned.apk \
+              --repo "$GITHUB_REPOSITORY" --yes || true
+            gh release delete-asset "$RELEASE_TAG" \
+              SimpleTimeTracker-1.59.1-calendar-release-unsigned.apk.sha256 \
+              --repo "$GITHUB_REPOSITORY" --yes || true
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Simple Time Tracker 1.59.1 Calendar Drag" \
+              --notes-file dist/RELEASE_NOTES.md \
+              --prerelease
+            gh release upload "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" --clobber \
+              "dist/$APK_NAME" "dist/$APK_NAME.sha256"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Simple Time Tracker 1.59.1 Calendar Drag" \
+              --notes-file dist/RELEASE_NOTES.md \
+              --prerelease \
+              "dist/$APK_NAME" "dist/$APK_NAME.sha256"
+          fi
