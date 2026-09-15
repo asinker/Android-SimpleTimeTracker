@@ -4,6 +4,19 @@
     <b>Simple Time Tracker</b>
 </h1>
 
+> [!IMPORTANT]
+> **Unofficial modified fork / 非官方修改版**
+>
+> This repository is an independently maintained fork of
+> [Razeeman/Android-SimpleTimeTracker](https://github.com/Razeeman/Android-SimpleTimeTracker).
+> It is not an official release and is not affiliated with or endorsed by the upstream maintainers.
+> Modifications have been maintained by Asinker since September 15, 2026; see
+> [MODIFICATIONS.md](MODIFICATIONS.md) for details.
+>
+> 本仓库是上述项目的独立维护分支，并非原项目官方版本，也不代表原作者立场。
+> 原项目及既有贡献的版权归原作者和各贡献者所有；本分支仅对新增修改负责。
+> Android 应用继续依照 GNU GPLv3 发布，Wear OS 部分继续沿用原项目声明的 MPL 2.0。
+
 <div align="center">
     Simple app that helps track how much time you spend on all the useless activities in the world.
 </div>
