@@ -1,150 +1,287 @@
-name: Publish signed release
+name: Android signed release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to publish
+        description: "要发布的已有标签，例如 v1.59.3"
         required: true
-        default: v1.59.2
+        type: string
 
-permissions:
-  contents: write
+# 同一版本只允许一个发版任务运行；重新执行时取消旧任务。
+concurrency:
+  group: android-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  release:
-    name: Build and publish Base Release
+  metadata:
+    name: Validate release metadata
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      apk_name: ${{ steps.release.outputs.apk_name }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
 
     steps:
-      - name: Select release tag
+      - name: Check out source and tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag and source version
         id: release
-        shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           PUSH_TAG: ${{ github.ref_name }}
           MANUAL_TAG: ${{ inputs.tag }}
         run: |
+          set -euo pipefail
+
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             RELEASE_TAG="$MANUAL_TAG"
           else
             RELEASE_TAG="$PUSH_TAG"
           fi
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid release tag: $RELEASE_TAG" >&2
+            echo "Expected semantic version such as v1.59.3 or v1.60.0-rc.1" >&2
             exit 1
           fi
+
+          git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null
+
           RELEASE_VERSION="${RELEASE_TAG#v}"
+          SOURCE_VERSION="$(
+            git show "${RELEASE_TAG}:buildSrc/src/main/kotlin/com/example/util/simpletimetracker/Base.kt" | \
+              sed -n 's/.*const val versionName = "\([^"]*\)".*/\1/p' | head -n 1
+          )"
+
+          if [[ "$SOURCE_VERSION" != "$RELEASE_VERSION" ]]; then
+            echo "Tag version ($RELEASE_VERSION) does not match Base.versionName ($SOURCE_VERSION)." >&2
+            exit 1
+          fi
+
+          IS_PRERELEASE=false
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            IS_PRERELEASE=true
+          fi
+
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
           echo "apk_name=SimpleTimeTracker-$RELEASE_VERSION.apk" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
 
+  build:
+    name: Check, build, sign and verify
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+
+    steps:
       - name: Check out tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          ref: ${{ steps.release.outputs.tag }}
+          ref: ${{ needs.metadata.outputs.tag }}
+          persist-credentials: false
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - name: Set up Java 21
+        uses: actions/setup-java@v6
         with:
           distribution: zulu
-          java-version: '21'
+          java-version: "21"
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-cleanup: on-success
+          validate-wrappers: true
 
-      - name: Run calendar drag tests
-        run: ./gradlew :feature_records:testDebugUnitTest --stacktrace
+      - name: Run style checks, unit tests and release build
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace \
+            ktlintCheck \
+            testDebugUnitTest \
+            :app:assembleBaseRelease
 
-      - name: Build Base Release
-        run: ./gradlew :app:assembleBaseRelease --stacktrace
-
-      - name: Sign and verify APK
-        shell: bash
+      - name: Validate signing secrets
         env:
-          APK_NAME: ${{ steps.release.outputs.apk_name }}
           SIGNING_KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_B64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          test -n "$SIGNING_KEY_B64"
-          test -n "$KEYSTORE_PASSWORD"
-          test -n "$KEY_ALIAS"
-          test -n "$KEY_PASSWORD"
+          set -euo pipefail
+          for variable in SIGNING_KEY_B64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "Missing required GitHub Actions secret: $variable" >&2
+              exit 1
+            fi
+          done
+
+      - name: Align, sign and verify APK
+        env:
+          APK_NAME: ${{ needs.metadata.outputs.apk_name }}
+          SIGNING_KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          EXPECTED_CERT_SHA256: 7338BF172B19103F901E712ACE9C3A4CC0FD243AC45DC75F3A8BD96D9DE02709
+        run: |
+          set -euo pipefail
+
+          KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
+          ALIGNED_APK="$RUNNER_TEMP/aligned-release.apk"
+          trap 'rm -f "$KEYSTORE_FILE" "$ALIGNED_APK"' EXIT
+
           mkdir -p dist
-          printf '%s' "$SIGNING_KEY_B64" | base64 --decode > "$RUNNER_TEMP/release.jks"
-          BUILD_TOOLS_DIR="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          printf '%s' "$SIGNING_KEY_B64" | base64 --decode > "$KEYSTORE_FILE"
+
+          BUILD_TOOLS_DIR="$(find "$ANDROID_SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          UNSIGNED_APK="$(find app/build/outputs/apk/base/release -maxdepth 1 -type f -name '*-unsigned.apk' -print -quit)"
+
+          if [[ -z "$BUILD_TOOLS_DIR" || -z "$UNSIGNED_APK" ]]; then
+            echo "Android build tools or unsigned Base Release APK was not found." >&2
+            exit 1
+          fi
+
+          "$BUILD_TOOLS_DIR/zipalign" -f -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
           "$BUILD_TOOLS_DIR/apksigner" sign \
-            --ks "$RUNNER_TEMP/release.jks" \
+            --ks "$KEYSTORE_FILE" \
             --ks-key-alias "$KEY_ALIAS" \
             --ks-pass env:KEYSTORE_PASSWORD \
             --key-pass env:KEY_PASSWORD \
+            --v4-signing-enabled false \
             --out "dist/$APK_NAME" \
-            app/build/outputs/apk/base/release/app-base-release-unsigned.apk
-          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "dist/$APK_NAME"
+            "$ALIGNED_APK"
 
-      - name: Prepare release files
-        shell: bash
+          "$BUILD_TOOLS_DIR/zipalign" -c -P 16 -v 4 "dist/$APK_NAME"
+          VERIFY_OUTPUT="$("$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "dist/$APK_NAME")"
+          printf '%s\n' "$VERIFY_OUTPUT"
+
+          NORMALIZED_VERIFY="$(printf '%s' "$VERIFY_OUTPUT" | tr '[:lower:]' '[:upper:]' | tr -d ':')"
+          if [[ "$NORMALIZED_VERIFY" != *"$EXPECTED_CERT_SHA256"* ]]; then
+            echo "The APK was signed by an unexpected certificate." >&2
+            exit 1
+          fi
+
+          sha256sum "dist/$APK_NAME" > "dist/$APK_NAME.sha256"
+
+      - name: Upload signed APK as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: SimpleTimeTracker-${{ needs.metadata.outputs.version }}
+          path: |
+            dist/${{ needs.metadata.outputs.apk_name }}
+            dist/${{ needs.metadata.outputs.apk_name }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download signed APK
+        uses: actions/download-artifact@v8
+        with:
+          name: SimpleTimeTracker-${{ needs.metadata.outputs.version }}
+          path: dist
+
+      - name: Prepare release notes
         env:
-          APK_NAME: ${{ steps.release.outputs.apk_name }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: |
-          cd dist
-          sha256sum "$APK_NAME" > "$APK_NAME.sha256"
-          cat > RELEASE_NOTES.md <<EOF
-          ## Unofficial signed build / 非官方独立签名版本
+          cat > dist/RELEASE_NOTES.md <<'EOF'
+          ## 非官方独立签名版本
 
-          This is an independently maintained, unofficial modification of
-          [Razeeman/Android-SimpleTimeTracker](https://github.com/Razeeman/Android-SimpleTimeTracker).
-          It is not affiliated with or endorsed by the upstream maintainers.
+          这是基于 [Razeeman/Android-SimpleTimeTracker](https://github.com/Razeeman/Android-SimpleTimeTracker) 的非官方修改版本，与原项目维护者无隶属或背书关系。
 
-          本版本包含完整的日历编辑增强：长按拖动、跨日期移动、边缘自动滚动、选中反馈、调整后撤销、
-          相邻时间块结束点自动吸附，以及点击日历任意位置保存并结束编辑。
+          附件 APK 已由本分支的独立证书签名，可直接安装。由于签名与原版不同，不能覆盖安装原作者发布的版本；切换版本前请先备份数据。
 
-          **The attached APK is signed with this fork's independent release key and can be installed directly.**
-          Its signature is not the upstream author's signature, so it cannot update an upstream installation in place.
+          **签名证书 SHA-256**
+          `7338BF172B19103F901E712ACE9C3A4CC0FD243AC45DC75F3A8BD96D9DE02709`
 
-          **附件 APK 使用本分支自己的发布证书签名，可以直接安装。** 它不能覆盖原作者签名的正式版；如有冲突，请先备份数据再卸载原版。
+          **校验下载文件**
+          同时下载 `.apk` 与 `.sha256` 文件，然后执行：
+          `sha256sum -c SimpleTimeTracker-*.apk.sha256`
 
-          Signing certificate SHA-256 / 签名证书指纹：
-          7338BF172B19103F901E712ACE9C3A4CC0FD243AC45DC75F3A8BD96D9DE02709
+          本版本对应的完整源代码：
+          __SOURCE_URL__
 
-          Complete corresponding source is available from this release tag:
-          https://github.com/${GITHUB_REPOSITORY}/tree/${RELEASE_TAG}
-
-          The Android application and modifications remain licensed under GNU GPLv3 or later.
-          See LICENSE.md and MODIFICATIONS.md in the tagged source.
+          程序及修改继续遵循 GNU GPLv3 or later；详情见标签源码中的 `LICENSE.md` 和 `MODIFICATIONS.md`。
           EOF
+          sed -i "s|__SOURCE_URL__|https://github.com/${GITHUB_REPOSITORY}/tree/${RELEASE_TAG}|" dist/RELEASE_NOTES.md
 
-      - name: Publish GitHub release
-        shell: bash
+      - name: Create or update GitHub Release
         env:
-          APK_NAME: ${{ steps.release.outputs.apk_name }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          APK_NAME: ${{ needs.metadata.outputs.apk_name }}
+          IS_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
         run: |
+          set -euo pipefail
+
+          RELEASE_FLAGS=()
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            RELEASE_FLAGS+=(--prerelease --latest=false)
+          else
+            RELEASE_FLAGS+=(--prerelease=false --latest)
+          fi
+
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --title "Simple Time Tracker $RELEASE_VERSION" \
               --notes-file dist/RELEASE_NOTES.md \
-              --prerelease=false \
-              --latest
+              "${RELEASE_FLAGS[@]}"
             gh release upload "$RELEASE_TAG" \
-              --repo "$GITHUB_REPOSITORY" --clobber \
-              "dist/$APK_NAME" "dist/$APK_NAME.sha256"
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber \
+              "dist/$APK_NAME" \
+              "dist/$APK_NAME.sha256"
           else
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
               --title "Simple Time Tracker $RELEASE_VERSION" \
               --notes-file dist/RELEASE_NOTES.md \
-              --latest \
-              "dist/$APK_NAME" "dist/$APK_NAME.sha256"
+              --generate-notes \
+              "${RELEASE_FLAGS[@]}" \
+              "dist/$APK_NAME" \
+              "dist/$APK_NAME.sha256"
           fi
+
+      - name: Write release summary
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          APK_NAME: ${{ needs.metadata.outputs.apk_name }}
+        run: |
+          {
+            echo "## Android release published"
+            echo
+            echo "- Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+            echo "- APK: \`$APK_NAME\`"
+            echo "- Signature and SHA-256 checksum verified"
+          } >> "$GITHUB_STEP_SUMMARY"
