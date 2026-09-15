@@ -22,6 +22,9 @@ data class RecordsCalendarViewData(
         // Point.start / Point.end are offsets from it, so the absolute time
         // can be restored as rangeStart + Point.start / Point.end.
         val rangeStart: Long,
+        // Absolute end of this local calendar day. This can be 23 or 25 hours
+        // after rangeStart when daylight saving time changes.
+        val rangeEnd: Long,
     )
 
     data class Point(

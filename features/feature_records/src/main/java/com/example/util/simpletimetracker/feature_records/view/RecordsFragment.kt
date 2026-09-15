@@ -70,6 +70,10 @@ class RecordsFragment :
     )
     private val recordsAdapter: BaseRecyclerAdapter by lazy { buildAdapter() }
 
+    // Record picked with "move" in the quick actions, waiting for this screen to
+    // be the one in front before it becomes editable.
+    private var pendingCalendarEditId: Long? = null
+
     override fun initUi(): Unit = with(binding) {
         parentFragment?.postponeEnterTransition()
 
@@ -91,6 +95,10 @@ class RecordsFragment :
         // view model opens the add record screen with those times prefilled.
         binding.viewRecordsCalendar.root.onNewRecordSelectedListener =
             viewModel::onCalendarDragCreate
+        // Tapping the block in the calendar edit mode confirms the previewed
+        // range, which is then saved right away.
+        binding.viewRecordsCalendar.root.onRecordTimeAdjustedListener =
+            viewModel::onRecordTimeAdjusted
     }
 
     override fun initViewModel() {
@@ -102,6 +110,7 @@ class RecordsFragment :
             resetScreen.observe { resetScreen() }
             sharingData.observe(::onNewSharingData)
             previewUpdate.observe(::onPreviewUpdate)
+            calendarEditRequest.observe(::onCalendarEditRequest)
         }
         with(removeRecordViewModel) {
             needUpdate.observe {
@@ -119,6 +128,7 @@ class RecordsFragment :
     override fun onResume() {
         super.onResume()
         viewModel.onVisible()
+        startPendingCalendarEdit()
     }
 
     override fun onPause() {
@@ -144,6 +154,34 @@ class RecordsFragment :
     private fun switchState(isCalendarView: Boolean) = with(binding) {
         groupRecordsList.isVisible = !isCalendarView
         groupRecordsCalendar.isVisible = isCalendarView
+        // The handles only make sense while the timeline is on screen.
+        if (!isCalendarView) viewRecordsCalendar.root.exitEditMode()
+    }
+
+    /**
+     * "Move" was picked in the record quick actions opened from the calendar:
+     * the record has to become editable on the timeline right away, without any
+     * extra screen.
+     *
+     * The request is stored until the screen is back in front, because several
+     * day pages of the calendar keep their own RecordsFragment alive at the same
+     * time and only the visible one may react to it.
+     */
+    private fun onCalendarEditRequest(recordId: Long) {
+        pendingCalendarEditId = recordId
+        startPendingCalendarEdit()
+    }
+
+    private fun startPendingCalendarEdit() {
+        val recordId = pendingCalendarEditId ?: return
+        if (!isResumed) return
+        pendingCalendarEditId = null
+
+        val isCalendarView = binding.groupRecordsCalendar.isVisible
+        if (!isCalendarView) return
+
+        val isEditStarted = binding.viewRecordsCalendar.root.enterEditMode(recordId)
+        if (!isEditStarted) viewModel.onCalendarEditUnavailable()
     }
 
     private fun setRecordsState(

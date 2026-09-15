@@ -86,6 +86,8 @@
     <string name="no_records_exist">记录将在此处显示</string>
     <string name="record_add_hint">点击%s以添加新记录</string>
     <string name="record_date_hint">点击日期按钮选择日期</string>
+    <string name="records_calendar_edit_unavailable">无法在时间轴上调整这条记录</string>
+    <string name="records_calendar_time_adjusted">时间已调整</string>
 
     <!--  Statistics  -->
     <string name="statistics_total_tracked">总追踪时长</string>

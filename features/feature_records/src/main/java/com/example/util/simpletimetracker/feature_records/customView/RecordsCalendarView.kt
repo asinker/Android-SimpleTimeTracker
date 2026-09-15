@@ -19,6 +19,7 @@ import android.view.ContextThemeWrapper
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import androidx.appcompat.widget.AppCompatTextView
 import androidx.core.content.withStyledAttributes
@@ -44,6 +45,7 @@ import com.example.util.simpletimetracker.feature_views.isHorizontal
 import com.example.util.simpletimetracker.feature_views.viewData.RecordTypeIcon
 import kotlinx.parcelize.Parcelize
 import java.util.concurrent.TimeUnit
+import kotlin.math.abs
 
 class RecordsCalendarView @JvmOverloads constructor(
     context: Context,
@@ -59,6 +61,7 @@ class RecordsCalendarView @JvmOverloads constructor(
     private var nameTextSize: Float = 0f
     private var nameTextColor: Int = 0
     private var itemTagColor: Int = 0
+    private var dragPreviewTextColor: Int = 0
     private var legendTextSize: Float = 0f
     private var legendTextColor: Int = 0
     private var legendLineColor: Int = 0
@@ -133,28 +136,99 @@ class RecordsCalendarView @JvmOverloads constructor(
     // several days are shown at once).
     var onNewRecordSelectedListener: ((startTime: Long, endTime: Long) -> Unit)? = null
 
+    // Called when the user confirmed a new range for an existing record in the
+    // calendar edit mode, by tapping its block. Both values are absolute
+    // timestamps of the day the record is shown on. Editing itself never
+    // reports anything: the drag only previews, the tap is what commits.
+    var onRecordTimeAdjustedListener: ((recordId: Long, startTime: Long, endTime: Long) -> Unit)? = null
+
     // Drag on an empty area to create a new record.
     private var dragState: DragState = DragState.IDLE
+
     // Millis elapsed since the start of the day (0..dayInMillis), the same
     // units RecordsCalendarViewData.Point.start / Point.end use.
+    // While editing they hold the previewed range.
     private var dragStartTime: Long = 0L
     private var dragEndTime: Long = 0L
+
     // Time of the long press, kept fixed while the other end follows the finger.
     private var dragAnchorTime: Long = 0L
     private var dragColumnIndex: Int = 0
+
     // Last snapped grid step, used to fire a haptic tick only on step changes.
     private var dragLastSnapTime: Long = 0L
+
+    // Edit mode, entered through the "move" record quick action. Everything is
+    // keyed by record id and never by an object reference, because setData()
+    // rebuilds all Data every second on the "today" page.
+    private var editRecordId: Long? = null
+
+    // Last confirmed range of the edited record: the pending changes are the
+    // difference between it and dragStartTime / dragEndTime.
+    private var editSavedStart: Long = 0L
+    private var editSavedEnd: Long = 0L
+    private var editSavedColumnIndex: Int = 0
+
+    // Previewed range captured on ACTION_DOWN, used as the drag baseline and
+    // to roll the gesture back on ACTION_CANCEL.
+    private var editGrabStart: Long = 0L
+    private var editGrabEnd: Long = 0L
+    private var editGrabX: Float = 0f
+    private var editGrabY: Float = 0f
+    private var isEditDragMoved: Boolean = false
+    private var editDragStartedByLongPress: Boolean = false
+
+    // A tap that grabbed the edited block must not also be reported as a
+    // regular record click, otherwise editing would open the record screen.
+    private var suppressTapForGesture: Boolean = false
+    private val editHandleTouchSize: Float = 24.dpToPx().toFloat()
+    private val editHandleHeight: Float = 6.dpToPx().toFloat()
+    private val editHandleMinWidth: Float = 40.dpToPx().toFloat()
+    private val editOutlineStrokeWidth: Float = 2.dpToPx().toFloat()
+    private val editDragTouchSlop: Int = ViewConfiguration.get(context).scaledTouchSlop
+    private val editHandleBounds: RectF = RectF(0f, 0f, 0f, 0f)
+    private val editHandlePaint: Paint = Paint()
+    private val editOutlinePaint: Paint = Paint()
+    private val editSelectionHaloPaint: Paint = Paint()
+    private var editSelectionScale: Float = 1f
+    private var editSelectionAnimator: ValueAnimator? = null
+
+    private val edgeAutoScrollSize: Float = 48.dpToPx().toFloat()
+    private val edgeAutoScrollMaxStep: Float = 10.dpToPx().toFloat()
+    private var dragPointerX: Float = 0f
+    private var dragPointerY: Float = 0f
+    private var isEdgeAutoScrollRunning: Boolean = false
+    private val edgeAutoScrollRunnable = object : Runnable {
+        override fun run() = runEdgeAutoScrollFrame()
+    }
+
     private val dragPreviewPaint: Paint = Paint()
     private val dragPreviewStrokePaint: Paint = Paint()
     private val dragPreviewTextPaint: Paint = Paint()
     private val dragPreviewStrokeWidth: Float = 2.dpToPx().toFloat()
     private val dragPreviewTextPadding: Float = 4.dpToPx().toFloat()
     private var dragPreviewLabel: String = ""
+
     // Read once during construction, so the drag gesture itself never has to
     // touch Context / Resources while the finger is moving.
     private val amPmTemplate: String = context.getString(R.string.separator_template)
     private val minuteInMillis: Long = TimeUnit.MINUTES.toMillis(1)
     private val minDragDurationInMillis: Long = TimeUnit.MINUTES.toMillis(15)
+
+    // True while the user is inside edit mode, with or without a finger down.
+    private val isEditing: Boolean
+        get() = dragState == DragState.EDIT_IDLE ||
+            dragState == DragState.EDIT_DRAGGING_START ||
+            dragState == DragState.EDIT_DRAGGING_END ||
+            dragState == DragState.EDIT_DRAGGING_MOVE
+
+    // True when the previewed range differs from the last confirmed one, which
+    // is what the translucent "not saved yet" look is based on.
+    private val hasPendingEdit: Boolean
+        get() = editRecordId != null &&
+            (dragStartTime != editSavedStart ||
+                dragEndTime != editSavedEnd ||
+                dragColumnIndex != editSavedColumnIndex)
 
     private val nameTextView: AppCompatTextView by lazy {
         getTextView(
@@ -224,6 +298,7 @@ class RecordsCalendarView @JvmOverloads constructor(
         // Never leave a half finished drag behind: it would keep the parent
         // from receiving touches and hold on to stale state.
         cancelDragCreate()
+        exitEditMode()
         super.onDetachedFromWindow()
     }
 
@@ -274,6 +349,10 @@ class RecordsCalendarView @JvmOverloads constructor(
         if (dragState == DragState.DRAGGING_NEW) {
             drawNewRecordPreview(canvas)
         }
+        // Edit mode overlay, drawn on top of everything else.
+        if (isEditing) {
+            drawEditOverlay(canvas)
+        }
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -281,26 +360,59 @@ class RecordsCalendarView @JvmOverloads constructor(
         var handled = false
 
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> handled = true
+            MotionEvent.ACTION_DOWN -> {
+                onTouchDown(event)
+                handled = true
+            }
 
             MotionEvent.ACTION_MOVE -> {
-                if (dragState == DragState.DRAGGING_NEW) {
-                    onDragCreateMove(event)
-                    handled = true
+                when (dragState) {
+                    DragState.DRAGGING_NEW -> {
+                        onDragCreateMove(event)
+                        handled = true
+                    }
+                    DragState.EDIT_DRAGGING_START,
+                    DragState.EDIT_DRAGGING_END,
+                    DragState.EDIT_DRAGGING_MOVE,
+                    -> {
+                        onEditDragMove(event)
+                        handled = true
+                    }
+                    else -> {}
                 }
             }
 
             MotionEvent.ACTION_UP -> {
-                if (dragState == DragState.DRAGGING_NEW) {
-                    onDragCreateFinish()
-                    handled = true
+                when (dragState) {
+                    DragState.DRAGGING_NEW -> {
+                        onDragCreateFinish()
+                        handled = true
+                    }
+                    DragState.EDIT_DRAGGING_START,
+                    DragState.EDIT_DRAGGING_END,
+                    DragState.EDIT_DRAGGING_MOVE,
+                    -> {
+                        onEditDragFinish()
+                        handled = true
+                    }
+                    else -> {}
                 }
             }
 
             MotionEvent.ACTION_CANCEL -> {
-                if (dragState == DragState.DRAGGING_NEW) {
-                    cancelDragCreate()
-                    handled = true
+                when (dragState) {
+                    DragState.DRAGGING_NEW -> {
+                        cancelDragCreate()
+                        handled = true
+                    }
+                    DragState.EDIT_DRAGGING_START,
+                    DragState.EDIT_DRAGGING_END,
+                    DragState.EDIT_DRAGGING_MOVE,
+                    -> {
+                        cancelEditDrag()
+                        handled = true
+                    }
+                    else -> {}
                 }
             }
         }
@@ -329,6 +441,7 @@ class RecordsCalendarView @JvmOverloads constructor(
         isMilitary = viewData.isMilitary
         data = viewData.points.map(::processData)
         calculateHoursData()
+        syncEditMode()
         invalidate()
     }
 
@@ -339,6 +452,114 @@ class RecordsCalendarView @JvmOverloads constructor(
         lastPanFactor = 0f
         resetDragState()
         invalidate()
+    }
+
+    /**
+     * Enters edit mode for the given record: the block gets a highlighted
+     * outline and a handle on both ends, which can be dragged to change the
+     * time range. Nothing is saved until the user taps the block.
+     *
+     * Returns false when the record cannot be edited right here, which is the
+     * case when it is not visible on the currently shown days or when the day
+     * boundary cuts it: only the visible part of a clipped record is known
+     * here, so moving it would silently shorten it.
+     */
+    fun enterEditMode(recordId: Long): Boolean {
+        val (index, target) = findEditTarget(recordId) ?: return false
+        if (chartHeight <= 0f) return false
+        if (isRecordClipped(index = index, target = target)) return false
+
+        editRecordId = recordId
+        editSavedStart = target.point.start
+        editSavedEnd = target.point.end
+        editSavedColumnIndex = index
+        editGrabStart = editSavedStart
+        editGrabEnd = editSavedEnd
+        dragStartTime = editSavedStart
+        dragEndTime = editSavedEnd
+        dragAnchorTime = 0L
+        dragLastSnapTime = dragStartTime
+        dragColumnIndex = index
+        suppressTapForGesture = false
+        dragState = DragState.EDIT_IDLE
+        updateDragPreviewLabel()
+        animateEditSelection()
+        invalidate()
+        return true
+    }
+
+    /**
+     * Leaves edit mode. Unsaved changes are dropped, which is what tapping
+     * outside of the edited block does as well.
+     */
+    fun exitEditMode() {
+        if (!isEditing) return
+        resetDragState()
+        invalidate()
+    }
+
+    fun isEditingRecord(): Boolean = isEditing
+
+    /**
+     * Re-syncs edit mode with freshly built data. Everything is looked up by
+     * record id, so the "today" page rebuilding its data every second can never
+     * leave the handles pointing at a stale block; when the record is gone,
+     * edit mode ends.
+     */
+    private fun syncEditMode() {
+        val recordId = editRecordId ?: return
+        if (!isEditing) return
+
+        val (index, target) = findEditTarget(recordId) ?: run {
+            resetDragState()
+            return
+        }
+        // With a pending change the preview owns the times: a background
+        // refresh must not undo the user's unsaved drag.
+        if (dragState != DragState.EDIT_IDLE || hasPendingEdit) return
+
+        dragColumnIndex = index
+        editSavedColumnIndex = index
+
+        val start = target.point.start
+        val end = target.point.end
+        if (start == editSavedStart && end == editSavedEnd) return
+        editSavedStart = start
+        editSavedEnd = end
+        editGrabStart = start
+        editGrabEnd = end
+        dragStartTime = start
+        dragEndTime = end
+        dragLastSnapTime = start
+        updateDragPreviewLabel()
+    }
+
+    /**
+     * Finds the record on the shown columns, returning its column index and the
+     * laid out block. Only stored records are considered: untracked and running
+     * entries have no id to write back to.
+     */
+    private fun findEditTarget(recordId: Long): Pair<Int, Data>? {
+        data.forEachIndexed { index, column ->
+            column.data.firstOrNull {
+                (it.point.data.value as? RecordViewData.Tracked)?.id == recordId
+            }?.let { return index to it }
+        }
+        return null
+    }
+
+    /**
+     * A record starting before this day or ending after it only shows its
+     * visible part, so its real range is unknown here.
+     */
+    private fun isRecordClipped(
+        index: Int,
+        target: Data,
+    ): Boolean {
+        val column = data.getOrNull(index) ?: return true
+        val value = target.point.data.value as? RecordViewData.Tracked ?: return true
+        return value.timeStartedTimestamp < column.rangeStart ||
+            value.timeEndedTimestamp > column.rangeEnd
     }
 
     fun getScaleState(): ScaleState {
@@ -369,6 +590,8 @@ class RecordsCalendarView @JvmOverloads constructor(
                     getColor(R.styleable.RecordsCalendarView_calendarTextColor, Color.WHITE)
                 itemTagColor =
                     getColor(R.styleable.RecordsCalendarView_calendarTagColor, Color.WHITE)
+                dragPreviewTextColor =
+                    getColor(R.styleable.RecordsCalendarView_calendarDragPreviewTextColor, nameTextColor)
                 legendTextSize =
                     getDimensionPixelSize(R.styleable.RecordsCalendarView_calendarLegendTextSize, 14).toFloat()
                 legendTextColor =
@@ -447,9 +670,29 @@ class RecordsCalendarView @JvmOverloads constructor(
             isAntiAlias = true
             style = Paint.Style.FILL
             textAlign = Paint.Align.CENTER
-            color = nameTextColor
+            color = dragPreviewTextColor
             textSize = nameTextSize
             typeface = Typeface.DEFAULT_BOLD
+        }
+        editHandlePaint.apply {
+            isAntiAlias = true
+            style = Paint.Style.FILL
+            // Handles can extend beyond the record block, so use the calendar
+            // preview contrast color instead of the always-light record text.
+            color = dragPreviewTextColor
+        }
+        editOutlinePaint.apply {
+            isAntiAlias = true
+            style = Paint.Style.STROKE
+            color = nameTextColor
+            strokeWidth = editOutlineStrokeWidth
+        }
+        editSelectionHaloPaint.apply {
+            isAntiAlias = true
+            style = Paint.Style.STROKE
+            color = currentTimeLegendColor
+            alpha = EDIT_SELECTION_HALO_ALPHA
+            strokeWidth = 5.dpToPx().toFloat()
         }
     }
 
@@ -927,6 +1170,7 @@ class RecordsCalendarView @JvmOverloads constructor(
                         highlighted = false,
                         data = it,
                         rangeStart = 0L,
+                        rangeEnd = dayInMillis,
                     )
                     RecordsCalendarViewData(
                         currentTime = 18 * hourInMillis,
@@ -972,6 +1216,7 @@ class RecordsCalendarView @JvmOverloads constructor(
             highlighted = data.highlighted,
             data = res,
             rangeStart = data.rangeStart,
+            rangeEnd = data.rangeEnd,
         )
     }
 
@@ -1007,6 +1252,9 @@ class RecordsCalendarView @JvmOverloads constructor(
     }
 
     private fun onEventClick(event: MotionEvent) {
+        // A tap that grabbed the edited block commits the edit instead of
+        // opening the record, so it must never reach the click listener.
+        if (suppressTapForGesture) return
         onClick(event)?.value?.let(clickListener)
     }
 
@@ -1025,6 +1273,8 @@ class RecordsCalendarView @JvmOverloads constructor(
     private fun onEventScaleStart() {
         // A second finger aborts an in progress drag creation.
         cancelDragCreate()
+        // An in progress edit drag is rolled back, edit mode stays open.
+        cancelEditDrag()
         isScaling = true
         if (isSwiping) lastPanFactor = panFactor
     }
@@ -1091,20 +1341,97 @@ class RecordsCalendarView @JvmOverloads constructor(
         panFactor = panFactor.coerceIn(-maxPanAvailable, 0f)
     }
 
+    private fun updateEdgeAutoScroll() {
+        val delta = calculateEdgeAutoScrollDelta()
+        if (delta == 0f) {
+            stopEdgeAutoScroll()
+            return
+        }
+        if (!isEdgeAutoScrollRunning) {
+            isEdgeAutoScrollRunning = true
+            postOnAnimation(edgeAutoScrollRunnable)
+        }
+    }
+
+    private fun runEdgeAutoScrollFrame() {
+        if (!isEdgeAutoScrollRunning ||
+            dragState == DragState.IDLE ||
+            dragState == DragState.EDIT_IDLE
+        ) {
+            stopEdgeAutoScroll()
+            return
+        }
+
+        val delta = calculateEdgeAutoScrollDelta()
+        val previousPan = panFactor
+        panFactor += delta
+        coercePan()
+        if (delta == 0f || panFactor == previousPan) {
+            stopEdgeAutoScroll()
+            return
+        }
+
+        lastPanFactor = panFactor
+        when (dragState) {
+            DragState.DRAGGING_NEW -> updateDragCreate(dragPointerY)
+            DragState.EDIT_DRAGGING_START,
+            DragState.EDIT_DRAGGING_END,
+            DragState.EDIT_DRAGGING_MOVE,
+            -> updateEditDrag(
+                pointerX = dragPointerX,
+                pointerY = dragPointerY,
+                trackTouchSlop = false,
+            )
+            else -> {}
+        }
+        invalidate()
+        postOnAnimation(edgeAutoScrollRunnable)
+    }
+
+    private fun calculateEdgeAutoScrollDelta(): Float {
+        if (scaleFactor <= 1f) return 0f
+        return RecordsCalendarDragMath.autoScrollDelta(
+            pointerY = dragPointerY,
+            viewportTop = chartTopBound,
+            viewportBottom = chartBottomBound,
+            edgeSize = edgeAutoScrollSize,
+            maxStep = edgeAutoScrollMaxStep,
+        )
+    }
+
+    private fun stopEdgeAutoScroll() {
+        if (!isEdgeAutoScrollRunning) return
+        isEdgeAutoScrollRunning = false
+        removeCallbacks(edgeAutoScrollRunnable)
+        lastPanFactor = panFactor
+    }
+
     /**
-     * Long press dispatcher. A press on an existing block keeps the old
-     * quick actions behaviour, a press on an empty area starts drafting a
-     * brand new record.
+     * Long press dispatcher. A movable tracked record immediately becomes an
+     * edit drag, so the same held finger can move it. Unsupported records keep
+     * the quick actions behaviour, while an empty area drafts a new record.
      */
     private fun onEventLongPress(event: MotionEvent) {
         if (dragState != DragState.IDLE) return
 
         val existingPoint = findDataPoint(x = event.x, y = event.y)
-        if (existingPoint != null) {
-            onEventLongClick(event)
-        } else {
+        if (existingPoint == null) {
             onDragCreateStart(event)
+            return
         }
+
+        val recordId = (existingPoint.point.data.value as? RecordViewData.Tracked)?.id
+        if (recordId != null && enterEditMode(recordId)) {
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            beginEditDrag(
+                event = event,
+                grabbed = DragState.EDIT_DRAGGING_MOVE,
+                startedByLongPress = true,
+            )
+            return
+        }
+
+        onEventLongClick(event)
     }
 
     private fun onDragCreateStart(event: MotionEvent) {
@@ -1115,6 +1442,8 @@ class RecordsCalendarView @JvmOverloads constructor(
         parent?.requestDisallowInterceptTouchEvent(true)
 
         dragColumnIndex = xToColumnIndex(event.x)
+        dragPointerX = event.x
+        dragPointerY = event.y
         // Anchor is snapped, so the draft always sits on the grid.
         dragAnchorTime = snapToStep(yToTime(event.y))
         dragStartTime = dragAnchorTime
@@ -1126,7 +1455,14 @@ class RecordsCalendarView @JvmOverloads constructor(
     }
 
     private fun onDragCreateMove(event: MotionEvent) {
-        val current = snapToStep(yToTime(event.y))
+        dragPointerX = event.x
+        dragPointerY = event.y
+        updateDragCreate(event.y)
+        updateEdgeAutoScroll()
+    }
+
+    private fun updateDragCreate(pointerY: Float) {
+        val current = snapToStep(yToTime(pointerY))
         // Mechanical tick, but only when the snapped quarter hour step changes.
         if (current != dragLastSnapTime) {
             dragLastSnapTime = current
@@ -1150,28 +1486,111 @@ class RecordsCalendarView @JvmOverloads constructor(
         // Restore absolute time of the day the drag happened on, then clamp it
         // to that whole day so nothing outside the day can ever be reported.
         val columnIndex = dragColumnIndex.coerceIn(0, dataSize - 1)
-        val dayRangeStart = data.getOrNull(columnIndex)?.rangeStart ?: 0L
-        val dayRangeEnd = dayRangeStart + dayInMillis
-        val absoluteStart = (dayRangeStart + start).coerceIn(dayRangeStart, dayRangeEnd)
-        val absoluteEnd = (dayRangeStart + end).coerceIn(dayRangeStart, dayRangeEnd)
+        val column = data.getOrNull(columnIndex) ?: return
+        val absoluteRange = RecordsCalendarDragMath.toAbsoluteRange(
+            rangeStart = column.rangeStart,
+            rangeEnd = column.rangeEnd,
+            startOffset = start,
+            endOffset = end,
+        )
 
         resetDragState()
         invalidate()
 
         // Never report an empty or inverted range.
-        if (absoluteEnd <= absoluteStart) return
+        if (absoluteRange.end <= absoluteRange.start) return
 
-        onNewRecordSelectedListener?.invoke(absoluteStart, absoluteEnd)
+        onNewRecordSelectedListener?.invoke(absoluteRange.start, absoluteRange.end)
     }
 
     private fun cancelDragCreate() {
-        if (dragState == DragState.IDLE) return
+        if (dragState != DragState.DRAGGING_NEW) return
         resetDragState()
         invalidate()
     }
 
+    /**
+     * ACTION_DOWN dispatcher. In edit mode it decides which part of the
+     * highlighted block was grabbed: the handle on one end, the block itself,
+     * or nothing, which leaves edit mode and drops unsaved changes.
+     */
+    private fun onTouchDown(event: MotionEvent) {
+        suppressTapForGesture = false
+        if (dragState != DragState.EDIT_IDLE) return
+
+        findEditTarget(editRecordId ?: return)?.second ?: run {
+            exitEditMode()
+            return
+        }
+
+        val startY = timeToY(dragStartTime)
+        val endY = timeToY(dragEndTime)
+        val bodyTop = minOf(startY, endY)
+        val bodyBottom = maxOf(startY, endY)
+        val bodyLeft = chartLeftBound + columnWidth * dragColumnIndex
+        val bodyRight = bodyLeft + columnWidth
+        val isOverHandleX = event.x >= bodyLeft - editHandleTouchSize &&
+            event.x <= bodyRight + editHandleTouchSize
+
+        val grabbed = when {
+            isOverHandleX && abs(event.y - startY) <= editHandleTouchSize ->
+                DragState.EDIT_DRAGGING_START
+
+            isOverHandleX && abs(event.y - endY) <= editHandleTouchSize ->
+                DragState.EDIT_DRAGGING_END
+
+            bodyLeft < event.x && bodyRight > event.x &&
+                bodyTop < event.y && bodyBottom > event.y ->
+                DragState.EDIT_DRAGGING_MOVE
+
+            else -> null
+        }
+
+        if (grabbed == null) {
+            // Touched outside of the edited block: that is "cancel", so the
+            // unsaved range is dropped and the gesture is consumed, keeping it
+            // from opening whatever record happens to be under the finger.
+            suppressTapForGesture = true
+            exitEditMode()
+            return
+        }
+
+        beginEditDrag(
+            event = event,
+            grabbed = grabbed,
+            startedByLongPress = false,
+        )
+    }
+
+    private fun beginEditDrag(
+        event: MotionEvent,
+        grabbed: DragState,
+        startedByLongPress: Boolean,
+    ) {
+        editGrabStart = dragStartTime
+        editGrabEnd = dragEndTime
+        editGrabX = event.x
+        editGrabY = event.y
+        dragPointerX = event.x
+        dragPointerY = event.y
+        isEditDragMoved = false
+        editDragStartedByLongPress = startedByLongPress
+        dragAnchorTime = snapToStep(yToTime(event.y))
+        dragLastSnapTime = dragAnchorTime
+        parent?.requestDisallowInterceptTouchEvent(true)
+        if (grabbed == DragState.EDIT_DRAGGING_MOVE) {
+            // Moving or confirming an edit must not also open the record.
+            suppressTapForGesture = true
+        }
+        dragState = grabbed
+    }
+
     private fun resetDragState() {
-        if (dragState == DragState.DRAGGING_NEW) {
+        stopEdgeAutoScroll()
+        editSelectionAnimator?.cancel()
+        editSelectionAnimator = null
+        editSelectionScale = 1f
+        if (dragState != DragState.IDLE) {
             parent?.requestDisallowInterceptTouchEvent(false)
         }
         dragState = DragState.IDLE
@@ -1180,6 +1599,207 @@ class RecordsCalendarView @JvmOverloads constructor(
         dragEndTime = 0L
         dragLastSnapTime = 0L
         dragPreviewLabel = ""
+        editRecordId = null
+        editSavedStart = 0L
+        editSavedEnd = 0L
+        editSavedColumnIndex = 0
+        editGrabStart = 0L
+        editGrabEnd = 0L
+        editGrabX = 0f
+        editGrabY = 0f
+        isEditDragMoved = false
+        editDragStartedByLongPress = false
+        // suppressTapForGesture is intentionally left alone here: it has to
+        // survive until the next ACTION_DOWN, so the tap that committed an edit
+        // (or the tap that left edit mode) never doubles as a record click.
+    }
+
+    /**
+     * Drag on the handles or on the block itself. Everything is a preview: the
+     * range is only reported to the listener when the user taps the block.
+     */
+    private fun onEditDragMove(event: MotionEvent) {
+        dragPointerX = event.x
+        dragPointerY = event.y
+        updateEditDrag(pointerX = event.x, pointerY = event.y, trackTouchSlop = true)
+        updateEdgeAutoScroll()
+    }
+
+    private fun updateEditDrag(
+        pointerX: Float,
+        pointerY: Float,
+        trackTouchSlop: Boolean,
+    ) {
+        if (trackTouchSlop && !isEditDragMoved &&
+            (abs(pointerX - editGrabX) > editDragTouchSlop ||
+                abs(pointerY - editGrabY) > editDragTouchSlop)
+        ) {
+            isEditDragMoved = true
+        }
+        val current = snapToStep(yToTime(pointerY))
+        // Mechanical tick, but only when the snapped quarter hour step changes.
+        if (current != dragLastSnapTime) {
+            dragLastSnapTime = current
+            performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+        }
+
+        when (dragState) {
+            DragState.EDIT_DRAGGING_START -> {
+                // The end stays where it was, the start follows the finger.
+                dragStartTime = current.coerceIn(
+                    minimumValue = 0L,
+                    maximumValue = editGrabEnd - minDragDurationInMillis,
+                )
+            }
+            DragState.EDIT_DRAGGING_END -> {
+                // The start stays where it was, the end follows the finger.
+                dragEndTime = current.coerceIn(
+                    minimumValue = editGrabStart + minDragDurationInMillis,
+                    maximumValue = dayInMillis,
+                )
+            }
+            DragState.EDIT_DRAGGING_MOVE -> {
+                // The whole block follows the finger in both axes: Y changes
+                // time and X selects the adjacent visible day.
+                val newColumnIndex = xToColumnIndex(pointerX)
+                if (newColumnIndex != dragColumnIndex) {
+                    dragColumnIndex = newColumnIndex
+                    performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                }
+                RecordsCalendarDragMath.moveRange(
+                    grabbedStart = editGrabStart,
+                    grabbedEnd = editGrabEnd,
+                    anchor = dragAnchorTime,
+                    current = current,
+                ).let {
+                    dragStartTime = it.start
+                    dragEndTime = it.end
+                }
+            }
+            else -> {}
+        }
+        updateDragPreviewLabel()
+        invalidate()
+    }
+
+    /**
+     * A move started by long press is saved as soon as the finger is released,
+     * matching calendar drag-and-drop behaviour. Existing handle editing keeps
+     * its preview-and-tap-to-confirm flow.
+     */
+    private fun onEditDragFinish() {
+        if (editDragStartedByLongPress) {
+            editDragStartedByLongPress = false
+            if (isEditDragMoved) {
+                snapEditRange()
+                commitEdit()
+            } else {
+                finishEditDragWithoutCommit()
+            }
+            return
+        }
+
+        val isBlockTapped = dragState == DragState.EDIT_DRAGGING_MOVE && !isEditDragMoved
+        if (isBlockTapped) {
+            commitEdit()
+            return
+        }
+
+        snapEditRange()
+        finishEditDragWithoutCommit()
+    }
+
+    private fun finishEditDragWithoutCommit() {
+        stopEdgeAutoScroll()
+        parent?.requestDisallowInterceptTouchEvent(false)
+        dragAnchorTime = 0L
+        dragLastSnapTime = dragStartTime
+        dragState = DragState.EDIT_IDLE
+        updateDragPreviewLabel()
+        invalidate()
+    }
+
+    /**
+     * Rolls an in progress drag back to the range it was started with, keeping
+     * edit mode open.
+     */
+    private fun cancelEditDrag() {
+        if (dragState != DragState.EDIT_DRAGGING_START &&
+            dragState != DragState.EDIT_DRAGGING_END &&
+            dragState != DragState.EDIT_DRAGGING_MOVE
+        ) {
+            return
+        }
+        dragStartTime = editGrabStart
+        dragEndTime = editGrabEnd
+        dragAnchorTime = 0L
+        dragLastSnapTime = dragStartTime
+        editDragStartedByLongPress = false
+        stopEdgeAutoScroll()
+        parent?.requestDisallowInterceptTouchEvent(false)
+        dragState = DragState.EDIT_IDLE
+        updateDragPreviewLabel()
+        invalidate()
+    }
+
+    /**
+     * Puts the previewed range back on the clock grid. A move keeps its exact
+     * duration, a resize only snaps the end the user dragged.
+     */
+    private fun snapEditRange() {
+        when (dragState) {
+            DragState.EDIT_DRAGGING_START -> {
+                dragStartTime = snapToStep(dragStartTime).coerceIn(
+                    minimumValue = 0L,
+                    maximumValue = dragEndTime - minDragDurationInMillis,
+                )
+            }
+            DragState.EDIT_DRAGGING_END -> {
+                dragEndTime = snapToStep(dragEndTime).coerceIn(
+                    minimumValue = dragStartTime + minDragDurationInMillis,
+                    maximumValue = dayInMillis,
+                )
+            }
+            DragState.EDIT_DRAGGING_MOVE -> {
+                val duration = dragEndTime - dragStartTime
+                dragStartTime = snapToStep(dragStartTime).coerceIn(0L, dayInMillis - duration)
+                dragEndTime = dragStartTime + duration
+            }
+            else -> {}
+        }
+    }
+
+    /**
+     * The tap that saves: the previewed range, if it changed anything, is
+     * reported to the listener and edit mode ends.
+     */
+    private fun commitEdit() {
+        val recordId = editRecordId
+        val isChanged = hasPendingEdit
+        val start = dragStartTime
+        val end = dragEndTime
+        val columnIndex = dragColumnIndex
+
+        // Restore absolute time of the day the record is shown on, then clamp
+        // it so nothing outside that day can ever be reported.
+        val column = data.getOrNull(columnIndex)
+        val absoluteRange = column?.let {
+            RecordsCalendarDragMath.toAbsoluteRange(
+                rangeStart = it.rangeStart,
+                rangeEnd = it.rangeEnd,
+                startOffset = start,
+                endOffset = end,
+            )
+        }
+
+        resetDragState()
+        invalidate()
+
+        if (recordId == null || !isChanged || absoluteRange == null) return
+        // Never report an empty or inverted range.
+        if (absoluteRange.end <= absoluteRange.start) return
+
+        onRecordTimeAdjustedListener?.invoke(recordId, absoluteRange.start, absoluteRange.end)
     }
 
     /**
@@ -1190,11 +1810,14 @@ class RecordsCalendarView @JvmOverloads constructor(
      *   boxShift  = chartHeight * time / dayInMillis
      */
     private fun timeToY(time: Long): Float {
-        if (chartHeight <= 0f) return chartTopBound + panFactor
-
-        val fraction = (time.toFloat() / dayInMillis).coerceIn(0f, 1f)
-        val offset = if (reverseOrder) chartHeight * fraction else chartHeight * (1f - fraction)
-        return chartTopBound + panFactor + offset * scaleFactor
+        return RecordsCalendarDragMath.timeToY(
+            time = time,
+            chartTop = chartTopBound,
+            chartHeight = chartHeight,
+            scale = scaleFactor,
+            pan = panFactor,
+            reverseOrder = reverseOrder,
+        )
     }
 
     /**
@@ -1206,17 +1829,14 @@ class RecordsCalendarView @JvmOverloads constructor(
      * rather than scrolling, so both terms are 0 by default.
      */
     private fun yToTime(y: Float): Long {
-        if (chartHeight <= 0f) return 0L
-
-        // Clamp to the currently visible chart, so dragging past the screen
-        // edge can never produce a timestamp outside this day.
-        val visibleTop = chartTopBound + panFactor
-        val visibleBottom = visibleTop + chartHeight * scaleFactor
-        val chartY = (y - paddingTop + scrollY).coerceIn(visibleTop, visibleBottom)
-
-        val offset = (chartY - chartTopBound - panFactor) / scaleFactor
-        val fraction = if (reverseOrder) offset / chartHeight else (chartHeight - offset) / chartHeight
-        return (fraction * dayInMillis).toLong().coerceIn(0L, dayInMillis)
+        return RecordsCalendarDragMath.yToTime(
+            y = y - paddingTop + scrollY,
+            chartTop = chartTopBound,
+            chartHeight = chartHeight,
+            scale = scaleFactor,
+            pan = panFactor,
+            reverseOrder = reverseOrder,
+        )
     }
 
     /**
@@ -1228,20 +1848,20 @@ class RecordsCalendarView @JvmOverloads constructor(
         timeMillis: Long,
         stepMinutes: Int = DEFAULT_SNAP_STEP_MINUTES,
     ): Long {
-        val step = TimeUnit.MINUTES.toMillis(stepMinutes.toLong())
-        if (step <= 0L) return timeMillis.coerceIn(0L, dayInMillis)
-
-        val shifted = timeMillis + startOfDayShift
-        val remainder = shifted % step
-        val rounded = if (remainder * 2 >= step) shifted - remainder + step else shifted - remainder
-        return (rounded - startOfDayShift).coerceIn(0L, dayInMillis)
+        return RecordsCalendarDragMath.snapToStep(
+            timeMillis = timeMillis,
+            startOfDayShift = startOfDayShift,
+            stepMinutes = stepMinutes,
+        )
     }
 
     private fun xToColumnIndex(x: Float): Int {
-        if (columnWidth <= 0f) return 0
-        return ((x - chartLeftBound) / columnWidth)
-            .toInt()
-            .coerceIn(0, dataSize - 1)
+        return RecordsCalendarDragMath.columnIndex(
+            x = x,
+            chartLeft = chartLeftBound,
+            columnWidth = columnWidth,
+            columnCount = dataSize,
+        )
     }
 
     /**
@@ -1288,6 +1908,101 @@ class RecordsCalendarView @JvmOverloads constructor(
             boxRight = boxRight,
             boxTop = boxTop,
         )
+    }
+
+    /**
+     * Draws the edit mode overlay on top of the record being edited.
+     *
+     * While a change is pending the block is shown as the same translucent
+     * ghost used when dragging out a new record, which reads as "not saved
+     * yet", together with its live start - end label. Without pending changes
+     * only a highlighted outline marks the block. Both ends always carry a
+     * capsule handle, whose position follows the previewed range, so it tracks
+     * the finger while dragging and stays correct under reverseOrder, where the
+     * start of the day is at the top.
+     */
+    private fun drawEditOverlay(canvas: Canvas) {
+        if (chartHeight <= 0f) return
+        if (editRecordId == null) return
+
+        val index = dragColumnIndex.coerceIn(0, dataSize - 1)
+        val boxLeft = chartLeftBound + columnWidth * index + paddingBetweenDays / 2
+        val boxRight = chartLeftBound + columnWidth * (index + 1) - paddingBetweenDays / 2
+        if (boxRight - boxLeft <= 0f) return
+
+        val startY = timeToY(dragStartTime)
+        val endY = timeToY(dragEndTime)
+        val boxTop = minOf(startY, endY)
+        var boxBottom = maxOf(startY, endY)
+        // Keep the shortest possible range visible.
+        val minHeight = chartHeight * scaleFactor * minDragDurationInMillis / dayInMillis
+        if (boxBottom - boxTop < minHeight) boxBottom = boxTop + minHeight
+
+        recordBounds.set(boxLeft, boxTop, boxRight, boxBottom)
+        canvas.save()
+        canvas.scale(
+            editSelectionScale,
+            editSelectionScale,
+            recordBounds.centerX(),
+            recordBounds.centerY(),
+        )
+        canvas.drawRoundRect(
+            recordBounds,
+            recordCornerRadius,
+            recordCornerRadius,
+            editSelectionHaloPaint,
+        )
+        if (hasPendingEdit) {
+            canvas.drawRoundRect(
+                recordBounds,
+                recordCornerRadius,
+                recordCornerRadius,
+                dragPreviewPaint,
+            )
+            canvas.drawRoundRect(
+                recordBounds,
+                recordCornerRadius,
+                recordCornerRadius,
+                dragPreviewStrokePaint,
+            )
+            drawNewRecordPreviewLabel(
+                canvas = canvas,
+                boxLeft = boxLeft,
+                boxRight = boxRight,
+                boxTop = boxTop,
+            )
+        } else {
+            canvas.drawRoundRect(
+                recordBounds,
+                recordCornerRadius,
+                recordCornerRadius,
+                editOutlinePaint,
+            )
+        }
+
+        // Capsule handles, never narrower than the minimum touch friendly width.
+        val columnWidthInPx = boxRight - boxLeft
+        val handleWidth = columnWidthInPx.coerceAtLeast(editHandleMinWidth)
+        val handleLeft = (boxLeft + boxRight) / 2f - handleWidth / 2f
+        val handleRight = handleLeft + handleWidth
+        val halfHandle = editHandleHeight / 2f
+
+        editHandleBounds.set(handleLeft, startY - halfHandle, handleRight, startY + halfHandle)
+        canvas.drawRoundRect(
+            editHandleBounds,
+            halfHandle,
+            halfHandle,
+            editHandlePaint,
+        )
+
+        editHandleBounds.set(handleLeft, endY - halfHandle, handleRight, endY + halfHandle)
+        canvas.drawRoundRect(
+            editHandleBounds,
+            halfHandle,
+            halfHandle,
+            editHandlePaint,
+        )
+        canvas.restore()
     }
 
     private fun drawNewRecordPreviewLabel(
@@ -1413,6 +2128,18 @@ class RecordsCalendarView @JvmOverloads constructor(
         animator.start()
     }
 
+    private fun animateEditSelection() {
+        editSelectionAnimator?.cancel()
+        editSelectionAnimator = ValueAnimator.ofFloat(editSelectionScale, EDIT_SELECTION_SCALE).apply {
+            duration = EDIT_SELECTION_ANIMATION_DURATION_MS
+            addUpdateListener {
+                editSelectionScale = it.animatedValue as Float
+                invalidate()
+            }
+            start()
+        }
+    }
+
     private fun calculateHoursData() {
         val hoursNumbers = (24 downTo 0)
             .map { if (it == 24 && startOfDayShift != 0L) 0 else it }
@@ -1455,6 +2182,7 @@ class RecordsCalendarView @JvmOverloads constructor(
         val highlighted: Boolean,
         val data: List<Data>,
         val rangeStart: Long,
+        val rangeEnd: Long,
     )
 
     private inner class Data(
@@ -1485,13 +2213,28 @@ class RecordsCalendarView @JvmOverloads constructor(
 
     enum class DragState {
         IDLE,
+
+        // Dragging a brand new range out of an empty area.
         DRAGGING_NEW,
+
+        // Edit mode with a handle on both ends, no finger down.
+        EDIT_IDLE,
+
+        // Edit mode, dragging the handle of one end.
+        EDIT_DRAGGING_START,
+        EDIT_DRAGGING_END,
+
+        // Edit mode, dragging the block itself.
+        EDIT_DRAGGING_MOVE,
     }
 
     companion object {
         private const val CLICK_ANIMATION_DURATION_MS: Long = 250L
         private const val DEFAULT_SNAP_STEP_MINUTES: Int = 15
         private const val DRAG_PREVIEW_ALPHA: Int = 90
+        private const val EDIT_SELECTION_HALO_ALPHA: Int = 110
+        private const val EDIT_SELECTION_SCALE: Float = 1.025f
+        private const val EDIT_SELECTION_ANIMATION_DURATION_MS: Long = 140L
         private const val DRAG_PREVIEW_TIME_SEPARATOR: String = " - "
         private const val MINUTES_IN_HOUR: Int = 60
         private const val AM_SUFFIX: String = "am"

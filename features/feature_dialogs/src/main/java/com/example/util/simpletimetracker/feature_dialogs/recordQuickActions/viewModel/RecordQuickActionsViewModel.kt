@@ -12,6 +12,7 @@ import com.example.util.simpletimetracker.core.repo.ResourceRepo
 import com.example.util.simpletimetracker.domain.base.UNTRACKED_ITEM_ID
 import com.example.util.simpletimetracker.domain.prefs.interactor.PrefsInteractor
 import com.example.util.simpletimetracker.domain.record.interactor.RecordInteractor
+import com.example.util.simpletimetracker.domain.record.interactor.RecordsCalendarDragEditInteractor
 import com.example.util.simpletimetracker.domain.record.interactor.RecordsContainerMultiselectInteractor
 import com.example.util.simpletimetracker.domain.record.interactor.RemoveRunningRecordMediator
 import com.example.util.simpletimetracker.domain.record.interactor.RunningRecordInteractor
@@ -48,6 +49,7 @@ class RecordQuickActionsViewModel @Inject constructor(
     private val recordInteractor: RecordInteractor,
     private val recordQuickActionsViewDataInteractor: RecordQuickActionsViewDataInteractor,
     private val recordQuickActionsInteractor: RecordQuickActionsInteractor,
+    private val recordsCalendarDragEditInteractor: RecordsCalendarDragEditInteractor,
     private val statisticsDetailNavigationInteractor: StatisticsDetailNavigationInteractor,
     private val recordActionDuplicateMediator: RecordActionDuplicateMediator,
     private val recordActionRepeatMediator: RecordActionRepeatMediator,
@@ -237,6 +239,19 @@ class RecordQuickActionsViewModel @Inject constructor(
     }
 
     private suspend fun onMove() {
+        // Opened from the records calendar: close the popup and let the record
+        // be adjusted straight on the timeline instead of picking a time.
+        if (extra.from is RecordQuickActionsParams.From.RecordsCalendar &&
+            !recordsContainerMultiselectInteractor.isEnabled
+        ) {
+            val recordId = (extra.type as? Type.RecordTracked)?.id
+            if (recordId != null) {
+                recordsCalendarDragEditInteractor.requestEdit(recordId)
+                exit()
+                return
+            }
+        }
+
         val timestamp: Long
         val type: DateTimeDialogType
 

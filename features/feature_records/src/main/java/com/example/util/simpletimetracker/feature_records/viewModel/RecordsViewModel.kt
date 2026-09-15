@@ -13,9 +13,12 @@ import com.example.util.simpletimetracker.core.interactor.SharingInteractor
 import com.example.util.simpletimetracker.core.mapper.RangeViewDataMapper
 import com.example.util.simpletimetracker.core.mapper.TimeMapper
 import com.example.util.simpletimetracker.core.model.NavigationTab
+import com.example.util.simpletimetracker.core.repo.ResourceRepo
 import com.example.util.simpletimetracker.domain.darkMode.interactor.ThemeChangedInteractor
 import com.example.util.simpletimetracker.domain.extension.orZero
 import com.example.util.simpletimetracker.domain.prefs.interactor.PrefsInteractor
+import com.example.util.simpletimetracker.domain.record.interactor.MoveRecordInteractor
+import com.example.util.simpletimetracker.domain.record.interactor.RecordsCalendarDragEditInteractor
 import com.example.util.simpletimetracker.domain.record.interactor.RecordsContainerMultiselectInteractor
 import com.example.util.simpletimetracker.domain.record.interactor.RecordsShareUpdateInteractor
 import com.example.util.simpletimetracker.domain.record.interactor.RecordsUpdateInteractor
@@ -28,12 +31,14 @@ import com.example.util.simpletimetracker.feature_base_adapter.ViewHolderType
 import com.example.util.simpletimetracker.feature_base_adapter.loader.LoaderViewData
 import com.example.util.simpletimetracker.feature_base_adapter.record.RecordViewData
 import com.example.util.simpletimetracker.feature_base_adapter.runningRecord.RunningRecordViewData
+import com.example.util.simpletimetracker.feature_records.R
 import com.example.util.simpletimetracker.feature_records.extra.RecordsExtra
 import com.example.util.simpletimetracker.feature_records.interactor.RecordsViewDataInteractor
 import com.example.util.simpletimetracker.feature_records.mapper.RecordsViewDataMapper
 import com.example.util.simpletimetracker.feature_records.model.RecordsShareState
 import com.example.util.simpletimetracker.feature_records.model.RecordsState
 import com.example.util.simpletimetracker.navigation.Router
+import com.example.util.simpletimetracker.navigation.params.notification.SnackBarParams
 import com.example.util.simpletimetracker.navigation.params.screen.ChangeRecordFromMainParams
 import com.example.util.simpletimetracker.navigation.params.screen.ChangeRecordParams
 import com.example.util.simpletimetracker.navigation.params.screen.ChangeRunningRecordFromMainParams
@@ -64,6 +69,9 @@ class RecordsViewModel @Inject constructor(
     private val recordsContainerMultiselectInteractor: RecordsContainerMultiselectInteractor,
     private val themeChangedInteractor: ThemeChangedInteractor,
     private val timeMapper: TimeMapper,
+    private val moveRecordInteractor: MoveRecordInteractor,
+    private val recordsCalendarDragEditInteractor: RecordsCalendarDragEditInteractor,
+    private val resourceRepo: ResourceRepo,
 ) : BaseViewModel() {
 
     var extra: RecordsExtra? = null
@@ -78,6 +86,10 @@ class RecordsViewModel @Inject constructor(
     val sharingData: SingleLiveEvent<RecordsShareState> = SingleLiveEvent()
     val resetScreen: SingleLiveEvent<Unit> = SingleLiveEvent()
     val previewUpdate: SingleLiveEvent<UpdateRunningRecordsInteractor.Update> = SingleLiveEvent()
+
+    // "Move" was picked in the record quick actions opened from the calendar:
+    // that record has to become editable on the timeline.
+    val calendarEditRequest: SingleLiveEvent<Long> = SingleLiveEvent()
 
     private var isVisible: Boolean = false
     private var timerJob: Job? = null
@@ -96,8 +108,14 @@ class RecordsViewModel @Inject constructor(
 
     fun onCalendarLongClick(item: ViewHolderType) {
         when (item) {
-            is RecordViewData -> onRecordLongClick(item)
-            is RunningRecordViewData -> onRunningRecordLongClick(item)
+            is RecordViewData -> onRecordLongClick(
+                item = item,
+                from = RecordQuickActionsParams.From.RecordsCalendar,
+            )
+            is RunningRecordViewData -> onRunningRecordLongClick(
+                item = item,
+                from = RecordQuickActionsParams.From.RecordsCalendar,
+            )
         }
     }
 
@@ -161,6 +179,7 @@ class RecordsViewModel @Inject constructor(
     fun onRunningRecordLongClick(
         item: RunningRecordViewData,
         sharedElements: Pair<Any, String>? = null,
+        from: RecordQuickActionsParams.From = RecordQuickActionsParams.From.Other,
     ) {
         if (recordsContainerMultiselectInteractor.isEnabled) {
             val id = MultiSelectedRecordId.Running(item.id)
@@ -179,6 +198,7 @@ class RecordsViewModel @Inject constructor(
                 iconId = item.iconId.toParams(),
                 color = item.color,
             ),
+            from = from,
         )
         throttle {
             router.navigate(navParams)
@@ -189,6 +209,7 @@ class RecordsViewModel @Inject constructor(
     fun onRecordLongClick(
         item: RecordViewData,
         sharedElements: Pair<Any, String>? = null,
+        from: RecordQuickActionsParams.From = RecordQuickActionsParams.From.Other,
     ) {
         if (recordsContainerMultiselectInteractor.isEnabled) {
             val id = when (item) {
@@ -220,6 +241,7 @@ class RecordsViewModel @Inject constructor(
                 iconId = item.iconId.toParams(),
                 color = item.color,
             ),
+            from = from,
         )
         throttle {
             router.navigate(navParams)
@@ -297,9 +319,64 @@ class RecordsViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Called when the user confirmed a new range by tapping the block in the
+     * calendar edit mode. The record is updated right away, without any extra
+     * screen, and the calendar is refreshed with the new range.
+     */
+    fun onRecordTimeAdjusted(
+        recordId: Long,
+        startTime: Long,
+        endTime: Long,
+    ) {
+        viewModelScope.launch {
+            val change = moveRecordInteractor.setTime(
+                recordId = recordId,
+                timeStarted = startTime,
+                timeEnded = endTime,
+            ) ?: return@launch
+            recordsUpdateInteractor.send()
+            router.show(
+                SnackBarParams(
+                    message = resourceRepo.getString(R.string.records_calendar_time_adjusted),
+                    duration = SnackBarParams.Duration.Long,
+                    actionText = resourceRepo.getString(R.string.record_removed_undo),
+                    actionListener = { undoRecordTimeAdjustment(change) },
+                ),
+            )
+        }
+    }
+
+    private fun undoRecordTimeAdjustment(change: MoveRecordInteractor.TimeChange) {
+        viewModelScope.launch {
+            if (moveRecordInteractor.undo(change)) {
+                recordsUpdateInteractor.send()
+            }
+        }
+    }
+
+    /**
+     * The record picked with "move" cannot be edited on the timeline, because
+     * it is not visible on the shown days or the day boundary cuts it in two.
+     */
+    fun onCalendarEditUnavailable() {
+        router.show(
+            SnackBarParams(
+                message = resourceRepo.getString(R.string.records_calendar_edit_unavailable),
+                duration = SnackBarParams.Duration.Short,
+            ),
+        )
+    }
+
     private fun subscribeToUpdates() {
         viewModelScope.launch {
             recordsUpdateInteractor.dataUpdated.collect { if (isVisible) updateRecords() }
+        }
+        viewModelScope.launch {
+            // Deliberately not gated on isVisible: the popup itself may be
+            // keeping this screen from being resumed, so the fragment decides
+            // when it is actually in front before acting on the request.
+            recordsCalendarDragEditInteractor.editRequested.collect { calendarEditRequest.set(it) }
         }
         viewModelScope.launch {
             recordsShareUpdateInteractor.shareClicked.collect { if (isVisible) onShareClicked() }

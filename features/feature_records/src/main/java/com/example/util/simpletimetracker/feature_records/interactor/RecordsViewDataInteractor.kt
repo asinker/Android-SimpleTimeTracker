@@ -211,6 +211,7 @@ class RecordsViewDataInteractor @Inject constructor(
                     highlighted = column.isToday,
                     data = points,
                     rangeStart = column.rangeStart,
+                    rangeEnd = column.rangeEnd,
                 )
             }
             .let { list ->

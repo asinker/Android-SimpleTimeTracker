@@ -86,6 +86,8 @@
     <string name="no_records_exist">Records will be shown here</string>
     <string name="record_add_hint">Click on %s to add new record</string>
     <string name="record_date_hint">Click on date button to select date</string>
+    <string name="records_calendar_edit_unavailable">This record cannot be adjusted on the timeline</string>
+    <string name="records_calendar_time_adjusted">Time adjusted</string>
 
     <!--  Statistics  -->
     <string name="statistics_total_tracked">Total tracked</string>
