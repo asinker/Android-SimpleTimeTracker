@@ -9,13 +9,10 @@ on:
       tag:
         description: Existing tag to publish
         required: true
-        default: v1.59.1
+        default: v1.59.2
 
 permissions:
   contents: write
-
-env:
-  APK_NAME: SimpleTimeTracker-1.59.1-calendar-release.apk
 
 jobs:
   release:
@@ -33,12 +30,18 @@ jobs:
           MANUAL_TAG: ${{ inputs.tag }}
         run: |
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            echo "tag=$MANUAL_TAG" >> "$GITHUB_OUTPUT"
-          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            echo "tag=$PUSH_TAG" >> "$GITHUB_OUTPUT"
+            RELEASE_TAG="$MANUAL_TAG"
           else
-            echo "tag=v1.59.1" >> "$GITHUB_OUTPUT"
+            RELEASE_TAG="$PUSH_TAG"
           fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          RELEASE_VERSION="${RELEASE_TAG#v}"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "apk_name=SimpleTimeTracker-$RELEASE_VERSION.apk" >> "$GITHUB_OUTPUT"
 
       - name: Check out tagged source
         uses: actions/checkout@v4
@@ -63,6 +66,7 @@ jobs:
       - name: Sign and verify APK
         shell: bash
         env:
+          APK_NAME: ${{ steps.release.outputs.apk_name }}
           SIGNING_KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_B64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -87,7 +91,9 @@ jobs:
       - name: Prepare release files
         shell: bash
         env:
+          APK_NAME: ${{ steps.release.outputs.apk_name }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           cd dist
           sha256sum "$APK_NAME" > "$APK_NAME.sha256"
@@ -98,7 +104,8 @@ jobs:
           [Razeeman/Android-SimpleTimeTracker](https://github.com/Razeeman/Android-SimpleTimeTracker).
           It is not affiliated with or endorsed by the upstream maintainers.
 
-          本版本增加了日历时间块长按拖动、跨日期移动、边缘自动滚动、选中反馈和调整后撤销等功能。
+          本版本包含完整的日历编辑增强：长按拖动、跨日期移动、边缘自动滚动、选中反馈、调整后撤销、
+          相邻时间块结束点自动吸附，以及点击日历任意位置保存并结束编辑。
 
           **The attached APK is signed with this fork's independent release key and can be installed directly.**
           Its signature is not the upstream author's signature, so it cannot update an upstream installation in place.
@@ -115,22 +122,18 @@ jobs:
           See LICENSE.md and MODIFICATIONS.md in the tagged source.
           EOF
 
-      - name: Publish GitHub prerelease
+      - name: Publish GitHub release
         shell: bash
         env:
+          APK_NAME: ${{ steps.release.outputs.apk_name }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release delete-asset "$RELEASE_TAG" \
-              SimpleTimeTracker-1.59.1-calendar-release-unsigned.apk \
-              --repo "$GITHUB_REPOSITORY" --yes || true
-            gh release delete-asset "$RELEASE_TAG" \
-              SimpleTimeTracker-1.59.1-calendar-release-unsigned.apk.sha256 \
-              --repo "$GITHUB_REPOSITORY" --yes || true
             gh release edit "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "Simple Time Tracker 1.59.1 Calendar Drag" \
+              --title "Simple Time Tracker $RELEASE_VERSION" \
               --notes-file dist/RELEASE_NOTES.md \
               --prerelease=false \
               --latest
@@ -140,7 +143,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "Simple Time Tracker 1.59.1 Calendar Drag" \
+              --title "Simple Time Tracker $RELEASE_VERSION" \
               --notes-file dist/RELEASE_NOTES.md \
               --latest \
               "dist/$APK_NAME" "dist/$APK_NAME.sha256"

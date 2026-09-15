@@ -8,6 +8,21 @@ Original project copyright remains with Anton Razinkov and the other upstream
 contributors. Copyright in new contributions remains with their respective
 contributors. The original Git history and authorship information are retained.
 
+## Calendar snap release 1.59.2
+
+Maintained by Asinker. First released on September 16, 2026.
+
+This release contains all calendar editing improvements from 1.59.1 and adds:
+
+- magnetic snapping of a moved block's start to a nearby previous block end;
+- the same magnetic snapping when adjusting the block's start handle;
+- target-day-aware snapping after moving a block to another visible date;
+- saving and leaving calendar edit mode by tapping the block, either handle,
+  or any other place in the calendar;
+- automated tests for snap thresholds and day-boundary constraints.
+
+The corresponding source snapshot is tagged `v1.59.2`.
+
 ## Calendar drag release 1.59.1
 
 Maintained by Asinker. First released on September 15, 2026.
